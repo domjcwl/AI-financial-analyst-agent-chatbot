@@ -1,7 +1,6 @@
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain.agents import create_agent
-from langchain_community.tools.yahoo_finance_news import YahooFinanceNewsTool
 from langchain_community.tools import DuckDuckGoSearchRun
 from dotenv import load_dotenv
 import os
@@ -15,13 +14,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 FMP_API_KEY = os.getenv("FMP_API_KEY")
 
 @tool
-def smart_news_search(query: str, ticker: str = None) -> str:
-    """
-    Finds news on the web. 
-    - Use 'ticker' if searching for a specific company (e.g., 'AAPL', 'TSLA').
-    - Use 'query' for general topics (e.g., 'inflation', 'tech trends').
-    """
-    print("="*50, f"Fetching financial news for {query}:", "="*50)
+def smart_news_search(query: str, ticker: str = None) -> str: 
+    """ 
+    Finds news on the web. - Use 'ticker' if searching for a specific company (e.g., 'AAPL', 'TSLA'). - Use 'query' for general topics (e.g., 'inflation', 'tech trends'). 
+    """ 
+    print("="*50, f"Fetching financial news for {query}:", "="*50) 
     return search_tool.run(f"{ticker} {query}" if (ticker and query) else query)
 
 
@@ -32,19 +29,16 @@ def get_financial_statements(ticker: str, period: str = "quarterly", limit: int 
     """
     print("="*50, "Fetching financial statements", "="*50)
     print("="*50,f"Ticker: {ticker}, Period: {period}, Limit: {limit}", "="*50)
-
-    base_url = "https://financialmodelingprep.com/stable"
-
     endpoints = {
-        "income_statement": f"{base_url}/income-statement?symbol={ticker}&period={period}&limit={limit}&apikey={FMP_API_KEY}",
-        "balance_sheet": f"{base_url}/balance-sheet-statement?symbol={ticker}&period={period}&limit={limit}&apikey={FMP_API_KEY}",
-        "cash_flow": f"{base_url}/cash-flow-statement?symbol={ticker}&period={period}&limit={limit}&apikey={FMP_API_KEY}",
+        "income_statement": f"https://financialmodelingprep.com/stable/income-statement?symbol={ticker}&period={period}&limit={limit}&apikey={FMP_API_KEY}",
+        "balance_sheet": f"https://financialmodelingprep.com/stable/balance-sheet-statement?symbol={ticker}&period={period}&limit={limit}&apikey={FMP_API_KEY}",
+        "cash_flow": f"https://financialmodelingprep.com/stable/cash-flow-statement?symbol={ticker}&period={period}&limit={limit}&apikey={FMP_API_KEY}",
     }
 
     results = {}
 
     for name, url in endpoints.items():
-        response = requests.get(url)
+        response = requests.get(url, timeout=5 )
         if response.status_code == 200:
             results[name] = response.json()
         else:
@@ -62,7 +56,9 @@ agent = create_agent(
     llm, 
     tools, 
     system_prompt = """You are a helpful AI financial analyst. Your goal is to provide deep, data-driven 
-insights. Follow these tool-specific rules:
+insights, and elaborate on topics given. Always ask the user for a follow up prompt that is relevant to the answer that you gave or relevant to the user's question/prompt.
+
+Follow these tool-specific rules:
 
 1. For 'get_financial_statements':
     - Always fetch the latest financial statements for the specified company.
@@ -72,17 +68,19 @@ insights. Follow these tool-specific rules:
     - Always provide a clear and concise summary of the financial health of the company based on the retrieved statements.
     
 2. For 'smart_news_search':
-   - Use this tool to find the latest news on specific companies or general financial topics.
-   - Always include the company ticker when searching for news about a specific stock.
-   - Always include the Source and Date for each news article in the final answer.
-   - Always go indepth on the news, providing a comprehensive summary and analysis of the key points, implications, and potential impact on the stock or market.
+   - Always dig deep into the news and explain each key portion of the news article with great depth, providing a comprehensive summary and analysis of the key points, implications, and potential impact on the stock or market.
+   - Always include the SOURCE OF THE NEWS and the DATE OF THE SOURCE OF THE NEWS for each news article in the final answer.
    - Always provide the latest news, ensuring that the information is up-to-date and relevant to the current market conditions.
    - Always provide a good and vast variety of news, covering different aspects such as earnings reports, market trends, analyst opinions, and any significant events that could affect the stock or market.
 """
 )
 
 result = agent.invoke({
-    "messages": [{"role": "user", "content": "give me the most recent news on nvidia and analyze the latest financial statements of the company."}]
+    "messages": [{"role": "user", "content": """ tell me more about the JP morgan stock
+                                                 """}]
 })
 
 print(result["messages"][-1].content)  # Final answer
+
+
+
