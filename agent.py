@@ -1,661 +1,924 @@
-from typing import Annotated, Sequence, TypedDict
-from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
-from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
-from langgraph.graph.message import add_messages
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-import httpx
-import os
-import requests
-from datetime import datetime, timedelta
-
-load_dotenv()
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-FMP_API_KEY     = os.getenv("FMP_API_KEY")       # https://financialmodelingprep.com/
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")   # https://finnhub.io/  (free: 60 req/min)
-
-# New FMP stable base URL (replaces deprecated /api/v3/)
-FMP_BASE = "https://financialmodelingprep.com/stable"
-
-
-# ── Agent State ──────────────────────────────────────────────────────────────
-
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-
-
-# ── Tools ────────────────────────────────────────────────────────────────────
-
-@tool
-def smart_news_search(ticker: str) -> str:
-    """
-    Find the latest news articles related to a stock ticker using Finnhub.
-    Provide the ticker symbol (e.g. 'AAPL').
-    Returns up to 5 recent news articles with title, source, date, summary and URL.
-    """
-    try:
-        today     = datetime.today().strftime("%Y-%m-%d")
-        from_date = (datetime.today() - timedelta(days=30)).strftime("%Y-%m-%d")
-
-        url = "https://finnhub.io/api/v1/company-news"
-        params = {
-            "symbol": ticker.upper(),
-            "from":   from_date,
-            "to":     today,
-            "token":  FINNHUB_API_KEY,
-        }
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        articles = response.json()
-
-        if not articles:
-            return f"No recent news found for '{ticker}' in the past 30 days."
-
-        # Sort by newest first and take top 5
-        articles = sorted(articles, key=lambda x: x.get("datetime", 0), reverse=True)[:5]
-
-        lines = [f"📰 Latest news for {ticker.upper()} (past 30 days):\n"]
-        for i, art in enumerate(articles, 1):
-            title    = art.get("headline", "N/A")
-            source   = art.get("source", "Unknown")
-            pub_ts   = art.get("datetime", 0)
-            pub_date = datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d") if pub_ts else "N/A"
-            summary  = art.get("summary", "")[:200]
-            url_link = art.get("url", "")
-            lines.append(
-                f"{i}. [{source}] {title} ({pub_date})\n"
-                f"   {summary}\n"
-                f"   🔗 {url_link}\n"
-            )
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"❌ News search failed for '{ticker}': {str(e)}"
-
-
-@tool
-def get_financial_statements(
-    ticker: str,
-    period: str = "annual",
-    limit: int = 1,
-) -> str:
-    """
-    Fetch income statement, balance sheet, and cash flow statement for a stock ticker.
-
-    Args:
-        ticker : Stock ticker symbol, e.g. 'AAPL', 'MSFT'.
-        period : 'annual' (default) or 'quarter'. Use 'quarter' when the user asks
-                 for quarterly data or a specific quarter (e.g. Q1 2023).
-        limit  : How many periods to return (default 1 = latest only).
-                 Set higher to retrieve historical data, e.g.:
-                   - "last 3 years"   -> limit=3,  period='annual'
-                   - "last 4 quarters"-> limit=4,  period='quarter'
-                   - "since 2020"     -> limit=5,  period='annual'  (approx years since 2020)
-                 Maximum useful value is 10 for annual, 16 for quarterly.
-
-    Examples the LLM should handle:
-        "Show AAPL financials"                 -> ticker='AAPL', period='annual', limit=1
-        "Show AAPL last 5 years of financials" -> ticker='AAPL', period='annual', limit=5
-        "MSFT quarterly financials"            -> ticker='MSFT', period='quarter', limit=4
-        "NVDA income statements since 2019"    -> ticker='NVDA', period='annual', limit=6
-    """
-    try:
-        sym        = ticker.upper()
-        period     = period.lower().strip()
-        # FMP accepts 'annual' or 'quarter'
-        fmp_period = "quarter" if period in ("quarter", "quarterly", "q") else "annual"
-        limit      = max(1, min(limit, 20))   # clamp to sensible range
-
-        def fetch(endpoint: str) -> list:
-            url = (
-                f"{FMP_BASE}/{endpoint}"
-                f"?symbol={sym}&period={fmp_period}&limit={limit}&apikey={FMP_API_KEY}"
-            )
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            return data if isinstance(data, list) else []
-
-        incomes   = fetch("income-statement")
-        balances  = fetch("balance-sheet-statement")
-        cashflows = fetch("cash-flow-statement")
-
-        if not incomes:
-            return f"❌ No financial statements found for '{sym}'. Check the ticker symbol."
-
-        # Build a lookup by date for balance sheet and cash flow
-        balance_by_date  = {b.get("date"): b for b in balances}
-        cashflow_by_date = {c.get("date"): c for c in cashflows}
-
-        def fmt(val):
-            if val is None:
-                return "N/A"
-            try:
-                return f"${float(val):,.0f}"
-            except (ValueError, TypeError):
-                return str(val)
-
-        period_label = "Quarterly" if fmp_period == "quarter" else "Annual"
-        sections = [
-            f"📊 {period_label} Financial Statements for {sym} "
-            f"({len(incomes)} period(s) returned)\n"
-        ]
-
-        for income in incomes:
-            date     = income.get("date", "N/A")
-            balance  = balance_by_date.get(date, {})
-            cashflow = cashflow_by_date.get(date, {})
-
-            sections.append(f"{'='*52}")
-            sections.append(f"  Period ending: {date}")
-            sections.append(f"{'='*52}")
-            sections.append("── INCOME STATEMENT ──────────────────────────────")
-            sections.append(f"  Revenue              : {fmt(income.get('revenue'))}")
-            sections.append(f"  Gross Profit         : {fmt(income.get('grossProfit'))}")
-            sections.append(f"  Operating Income     : {fmt(income.get('operatingIncome'))}")
-            sections.append(f"  Net Income           : {fmt(income.get('netIncome'))}")
-            sections.append(f"  EPS (diluted)        : {income.get('eps', 'N/A')}")
-            sections.append(f"  EBITDA               : {fmt(income.get('ebitda'))}")
-            sections.append("")
-            sections.append("── BALANCE SHEET ─────────────────────────────────")
-            sections.append(f"  Total Assets         : {fmt(balance.get('totalAssets'))}")
-            sections.append(f"  Total Liabilities    : {fmt(balance.get('totalLiabilities'))}")
-            sections.append(f"  Total Equity         : {fmt(balance.get('totalStockholdersEquity'))}")
-            sections.append(f"  Cash & Equivalents   : {fmt(balance.get('cashAndCashEquivalents'))}")
-            sections.append(f"  Total Debt           : {fmt(balance.get('totalDebt'))}")
-            sections.append("")
-            sections.append("── CASH FLOW STATEMENT ───────────────────────────")
-            sections.append(f"  Operating Cash Flow  : {fmt(cashflow.get('operatingCashFlow'))}")
-            sections.append(f"  Capital Expenditures : {fmt(cashflow.get('capitalExpenditure'))}")
-            sections.append(f"  Free Cash Flow       : {fmt(cashflow.get('freeCashFlow'))}")
-            sections.append(f"  Dividends Paid       : {fmt(cashflow.get('dividendsPaid'))}")
-            sections.append("")
-
-        return "\n".join(sections).strip()
-
-    except Exception as e:
-        return f"❌ Failed to fetch financial statements for '{ticker}': {str(e)}"
-
-
-@tool
-def get_analyst_data(ticker: str) -> str:
-    """
-    Fetch analyst sentiment data for a stock ticker.
-    Uses FMP stable endpoints:
-      - /stable/grades                  -> recent upgrade/downgrade actions (last 30)
-      - /stable/price-target-consensus  -> high / low / median / consensus price targets
-    """
-    try:
-        sym = ticker.upper()
-
-        # 1. Recent analyst grade actions (upgrades / downgrades / initiations)
-        grades_url = f"{FMP_BASE}/grades?symbol={sym}&limit=30&apikey={FMP_API_KEY}"
-        grades_r   = requests.get(grades_url, timeout=10)
-        grades_r.raise_for_status()
-        raw = grades_r.json()
-        grades_list = raw if isinstance(raw, list) else []
-
-        # 2. Consensus price target (high / low / median / consensus)
-        consensus_url = f"{FMP_BASE}/price-target-consensus?symbol={sym}&apikey={FMP_API_KEY}"
-        consensus_r   = requests.get(consensus_url, timeout=10)
-        consensus_r.raise_for_status()
-        consensus_data = consensus_r.json()
-        c = consensus_data[0] if isinstance(consensus_data, list) and consensus_data else {}
-
-        if not grades_list and not c:
-            return f"❌ No analyst data found for '{ticker}'."
-
-        def fmt(val):
-            try:
-                return f"${float(val):,.2f}"
-            except (ValueError, TypeError):
-                return str(val) if val else "N/A"
-
-        lines = [f"🎯 Analyst Data for {sym}\n"]
-
-        # Price target consensus block
-        if c:
-            lines.append("── PRICE TARGET CONSENSUS ───────────────────────")
-            lines.append(f"  Consensus Target : {fmt(c.get('priceTarget') or c.get('consensus'))}")
-            lines.append(f"  High Target      : {fmt(c.get('priceTargetHigh') or c.get('high'))}")
-            lines.append(f"  Low Target       : {fmt(c.get('priceTargetLow')  or c.get('low'))}")
-            lines.append(f"  Median Target    : {fmt(c.get('priceTargetMedian') or c.get('median'))}")
-            lines.append("")
-
-        # Tally grade actions into sentiment buckets
-        if grades_list:
-            buy_kw  = {"buy", "strong buy", "outperform", "overweight",
-                       "positive", "conviction buy", "add", "accumulate"}
-            hold_kw = {"hold", "neutral", "market perform", "equal weight",
-                       "peer perform", "in-line", "sector perform", "fair value"}
-            sell_kw = {"sell", "strong sell", "underperform", "underweight",
-                       "negative", "reduce", "avoid"}
-
-            counts = {"Buy / Outperform": 0, "Hold / Neutral": 0, "Sell / Underperform": 0}
-            recent_actions = []
-
-            for g in grades_list:
-                new_grade = (g.get("newGrade") or "").strip().lower()
-                action    = (g.get("action")   or "").strip()
-                firm      = g.get("gradingCompany") or g.get("company") or "Unknown"
-                date      = (g.get("date") or "")[:10]
-                prev      = g.get("previousGrade") or ""
-
-                if any(k in new_grade for k in buy_kw):
-                    counts["Buy / Outperform"] += 1
-                elif any(k in new_grade for k in sell_kw):
-                    counts["Sell / Underperform"] += 1
-                elif any(k in new_grade for k in hold_kw):
-                    counts["Hold / Neutral"] += 1
-
-                if len(recent_actions) < 5:
-                    grade_display = g.get("newGrade") or new_grade.title()
-                    prev_display  = f" (from {prev})" if prev else ""
-                    recent_actions.append(
-                        f"  • {date}  {firm:<30} {action:<12} -> {grade_display}{prev_display}"
-                    )
-
-            total = sum(counts.values()) or 1
-            lines.append("── GRADE SENTIMENT (last 30 actions) ────────────")
-            for label, n in counts.items():
-                pct = n / total * 100
-                bar = "█" * int(pct / 5)
-                lines.append(f"  {label:<22}: {n:>3}  {bar:<20} {pct:.1f}%")
-
-            lines.append("")
-            lines.append("── MOST RECENT ACTIONS ──────────────────────────")
-            lines.extend(recent_actions)
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"❌ Failed to fetch analyst data for '{ticker}': {str(e)}"
-
-
-@tool
-def get_key_metrics(ticker: str) -> str:
-    """
-    Fetch key financial metrics for a stock ticker, including:
-      - Price, market cap, 52-week range, beta  (FMP /stable/profile)
-      - Valuation ratios: P/E, P/B, P/S, EV/EBITDA, PEG  (FMP /stable/ratios TTM)
-      - Profitability: ROE, ROA, net/gross margin
-      - Liquidity & leverage: current ratio, debt/equity, interest coverage
-      - Dividends: yield and per-share amount
-    Use this for a snapshot of a company's fundamental health and valuation.
-    """
-    try:
-        sym = ticker.upper()
-
-        # 1. Company profile — price, market cap, 52-week range, beta, sector
-        profile_url = f"{FMP_BASE}/profile?symbol={sym}&apikey={FMP_API_KEY}"
-        profile_r   = requests.get(profile_url, timeout=10)
-        profile_r.raise_for_status()
-        profile_list = profile_r.json()
-        p = profile_list[0] if isinstance(profile_list, list) and profile_list else {}
-
-        # 2. TTM financial ratios — P/E, ROE, margins, etc.
-        # /stable/ratios returns the most reliable field names for the stable API
-        ratios_url = f"{FMP_BASE}/ratios?symbol={sym}&period=TTM&limit=1&apikey={FMP_API_KEY}"
-        ratios_r   = requests.get(ratios_url, timeout=10)
-        ratios_r.raise_for_status()
-        ratios_list = ratios_r.json()
-        r = ratios_list[0] if isinstance(ratios_list, list) and ratios_list else {}
-
-        # 3. TTM key metrics — EV/EBITDA, PEG, free cash flow yield, etc.
-        km_url  = f"{FMP_BASE}/key-metrics?symbol={sym}&period=TTM&limit=1&apikey={FMP_API_KEY}"
-        km_r    = requests.get(km_url, timeout=10)
-        km_r.raise_for_status()
-        km_list = km_r.json()
-        m = km_list[0] if isinstance(km_list, list) and km_list else {}
-
-        if not p and not r and not m:
-            return f"❌ No key metrics found for '{sym}'. Check the ticker symbol."
-
-        def f2(val, suffix="", prefix=""):
-            try:
-                return f"{prefix}{float(val):.2f}{suffix}"
-            except (ValueError, TypeError):
-                return "N/A"
-
-        def pct(val):
-            """Render a ratio that may already be a decimal (0.25) or percent (25.0)."""
-            try:
-                v = float(val)
-                # FMP returns most margin/yield ratios as decimals (0.xx)
-                return f"{v * 100:.2f}%" if abs(v) < 10 else f"{v:.2f}%"
-            except (ValueError, TypeError):
-                return "N/A"
-
-        mktcap = p.get("mktCap") or p.get("marketCap") or 0
-        try:
-            mktcap_fmt = f"${float(mktcap):,.0f}"
-        except (ValueError, TypeError):
-            mktcap_fmt = "N/A"
-
-        # 52-week range comes as "low-high" string in profile
-        range_str = str(p.get("range", ""))
-        if "-" in range_str:
-            parts    = range_str.split("-")
-            wk52_low  = f2(parts[0].strip(), prefix="$")
-            wk52_high = f2(parts[-1].strip(), prefix="$")
-        else:
-            wk52_low = wk52_high = "N/A"
-
-        report = f"""
-📈 Key Metrics for {sym} (TTM)
-
-── PRICE & MARKET ────────────────────────────────
-  Current Price        : {f2(p.get('price'), prefix='$')}
-  Market Cap           : {mktcap_fmt}
-  52-Week High         : {wk52_high}
-  52-Week Low          : {wk52_low}
-  Beta                 : {f2(p.get('beta'))}
-  Sector / Industry    : {p.get('sector', 'N/A')} / {p.get('industry', 'N/A')}
-
-── VALUATION ─────────────────────────────────────
-  P/E Ratio (TTM)      : {f2(r.get('priceEarningsRatio') or r.get('peRatio') or m.get('peRatio'))}
-  P/B Ratio            : {f2(r.get('priceToBookRatio') or r.get('pbRatio') or m.get('pbRatio'))}
-  P/S Ratio            : {f2(r.get('priceToSalesRatio') or m.get('priceToSalesRatio'))}
-  EV / EBITDA          : {f2(m.get('evToEbitda') or m.get('enterpriseValueOverEBITDA'))}
-  PEG Ratio            : {f2(r.get('priceEarningsToGrowthRatio') or m.get('pegRatio'))}
-  Price / FCF          : {f2(r.get('priceToFreeCashFlowsRatio') or m.get('pfcfRatio'))}
-
-── PROFITABILITY ─────────────────────────────────
-  Gross Profit Margin  : {pct(r.get('grossProfitMargin'))}
-  Operating Margin     : {pct(r.get('operatingProfitMargin'))}
-  Net Profit Margin    : {pct(r.get('netProfitMargin'))}
-  Return on Equity     : {pct(r.get('returnOnEquity') or r.get('roe'))}
-  Return on Assets     : {pct(r.get('returnOnAssets') or r.get('roa'))}
-  Return on Inv. Cap   : {pct(r.get('returnOnCapitalEmployed'))}
-
-── LIQUIDITY & LEVERAGE ──────────────────────────
-  Current Ratio        : {f2(r.get('currentRatio'))}
-  Quick Ratio          : {f2(r.get('quickRatio'))}
-  Debt to Equity       : {f2(r.get('debtEquityRatio') or r.get('debtToEquity'))}
-  Interest Coverage    : {f2(r.get('interestCoverage'))}
-
-── DIVIDENDS ─────────────────────────────────────
-  Dividend Yield       : {pct(r.get('dividendYield'))}
-  Dividend Per Share   : {f2(m.get('dividendPerShare'), prefix='$')}
-  Payout Ratio         : {pct(r.get('payoutRatio'))}
-""".strip()
-
-        return report
-
-    except Exception as e:
-        return f"❌ Failed to fetch key metrics for '{ticker}': {str(e)}"
-
-
-@tool
-def get_technical_indicators(ticker: str) -> str:
-    """
-    Fetch key technical indicators for a stock ticker using FMP stable endpoints.
-    Returns the latest values for:
-      - RSI(14)       — momentum / overbought-oversold (>70 overbought, <30 oversold)
-      - SMA(50)       — 50-day simple moving average
-      - SMA(200)      — 200-day simple moving average (trend baseline)
-      - EMA(12)       — 12-day exponential moving average
-      - EMA(26)       — 26-day exponential moving average (EMA12 vs EMA26 = MACD signal)
-      - ADX(14)       — trend strength (>25 = strong trend)
-      - Williams %R   — overbought/oversold oscillator
-    All indicators use daily (1day) timeframe.
-    Use this whenever the user asks about RSI, moving averages, momentum, or technical analysis.
-    """
-    try:
-        sym  = ticker.upper()
-        BASE = f"{FMP_BASE}/technical-indicators"
-
-        def fetch_indicator(name: str, period: int) -> dict:
-            """Fetch a single indicator and return the most recent data point."""
-            url = (
-                f"{BASE}/{name}"
-                f"?symbol={sym}&periodLength={period}&timeframe=1day"
-                f"&limit=1&apikey={FMP_API_KEY}"
-            )
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            return data[0] if isinstance(data, list) and data else {}
-
-        rsi       = fetch_indicator("rsi",      14)
-        sma50     = fetch_indicator("sma",      50)
-        sma200    = fetch_indicator("sma",     200)
-        ema12     = fetch_indicator("ema",      12)
-        ema26     = fetch_indicator("ema",      26)
-        adx       = fetch_indicator("adx",      14)
-        williams  = fetch_indicator("williams", 14)
-
-        if not any([rsi, sma50, sma200, ema12, ema26, adx, williams]):
-            return f"❌ No technical indicator data found for '{sym}'."
-
-        def f2(d, key):
-            """Extract and format a float value from a dict."""
-            val = d.get(key) if d else None
-            try:
-                return f"{float(val):.2f}"
-            except (ValueError, TypeError):
-                return "N/A"
-
-        def f2price(d, key):
-            try:
-                return f"${float(d.get(key)):.2f}"
-            except (ValueError, TypeError):
-                return "N/A"
-
-        # Derive MACD signal from EMA crossover
-        try:
-            macd_val = float(ema12.get("ema", 0)) - float(ema26.get("ema", 0))
-            macd_str = f"{macd_val:+.2f} ({'bullish cross' if macd_val > 0 else 'bearish cross'})"
-        except (ValueError, TypeError):
-            macd_str = "N/A"
-
-        # RSI interpretation
-        try:
-            rsi_val = float(rsi.get("rsi", 50))
-            if rsi_val >= 70:
-                rsi_signal = "⚠️  Overbought"
-            elif rsi_val <= 30:
-                rsi_signal = "⚠️  Oversold"
-            else:
-                rsi_signal = "✅  Neutral"
-        except (ValueError, TypeError):
-            rsi_signal = ""
-
-        # ADX interpretation
-        try:
-            adx_val = float(adx.get("adx", 0))
-            adx_signal = "Strong trend" if adx_val >= 25 else "Weak / no trend"
-        except (ValueError, TypeError):
-            adx_signal = ""
-
-        # SMA trend signal
-        try:
-            price  = float(sma50.get("close", 0))
-            s50    = float(sma50.get("sma", 0))
-            s200   = float(sma200.get("sma", 0))
-            if price > s50 > s200:
-                trend_signal = "📈 Bullish (price > SMA50 > SMA200)"
-            elif price < s50 < s200:
-                trend_signal = "📉 Bearish (price < SMA50 < SMA200)"
-            else:
-                trend_signal = "↔️  Mixed"
-        except (ValueError, TypeError):
-            trend_signal = "N/A"
-
-        # Reference date from RSI (most recent)
-        ref_date = (rsi or sma50 or {}).get("date", "N/A")
-
-        report = f"""
-📊 Technical Indicators for {sym}  (as of {ref_date}, daily)
-
-── MOMENTUM ──────────────────────────────────────
-  RSI (14)             : {f2(rsi, 'rsi')}  {rsi_signal}
-  Williams %R (14)     : {f2(williams, 'williams')}
-
-── MOVING AVERAGES ───────────────────────────────
-  SMA (50-day)         : {f2price(sma50, 'sma')}
-  SMA (200-day)        : {f2price(sma200, 'sma')}
-  EMA (12-day)         : {f2price(ema12, 'ema')}
-  EMA (26-day)         : {f2price(ema26, 'ema')}
-  Close Price          : {f2price(sma50, 'close')}
-
-── MACD (EMA12 − EMA26) ──────────────────────────
-  MACD Value           : {macd_str}
-
-── TREND STRENGTH ────────────────────────────────
-  ADX (14)             : {f2(adx, 'adx')}  ({adx_signal})
-  Trend Signal         : {trend_signal}
-""".strip()
-
-        return report
-
-    except Exception as e:
-        return f"❌ Failed to fetch technical indicators for '{ticker}': {str(e)}"
-
-
-# ── Model & Tool Node ────────────────────────────────────────────────────────
-
-tools     = [smart_news_search, get_financial_statements, get_analyst_data, get_key_metrics, get_technical_indicators]
-tool_node = ToolNode(tools)
-
-model = ChatOpenAI(
-    model="gpt-4o",
-    http_client=httpx.Client(verify=False),   # bypass corporate proxy/firewall if needed
-    api_key=OPENAI_API_KEY,
-    temperature=0,
-).bind_tools(tools)
-
-
-# ── System Prompt ────────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """
-You are an expert financial analyst assistant with deep knowledge of equity markets,
-fundamental analysis, and investment research.
-
-You have access to four tools:
-  • smart_news_search        – latest company news via Finnhub (past 30 days)
-  • get_financial_statements – income statement, balance sheet, cash flow (FMP stable API).
-                               Supports period=('annual'|'quarter') and limit=N for historical data.
-                               Infer limit from phrases like "last 3 years" (limit=3, period=annual),
-                               "since 2020" (limit=years since 2020), "last 4 quarters" (limit=4, period=quarter).
-  • get_analyst_data         – analyst grades summary + price target consensus (FMP stable API)
-  • get_key_metrics          – valuation (P/E, P/B, P/S, EV/EBITDA, PEG), profitability (ROE, margins),
-                               liquidity, dividends. Use for fundamental health snapshot.
-  • get_technical_indicators – RSI(14), SMA(50/200), EMA(12/26), MACD signal, ADX(14), Williams%%R.
-                               Use whenever the user asks about RSI, moving averages, momentum,
-                               overbought/oversold signals, or any technical analysis.
-
-GUIDELINES:
-- When the user mentions a ticker or company, proactively call the relevant tools to
-  ground your answer in real data.
-- For broad market research questions, combine news + key metrics + analyst data.
-- For deep-dive analysis requests, use all four tools and synthesise the results.
-- Always note that figures are as of the latest available period — not real-time intraday prices.
-- Be concise but thorough. Use bullet points and structured sections for readability.
-- If the user provides a company name without a ticker, infer the most likely ticker
-  before calling tools.
-- Never fabricate financial figures. If a tool returns an error, tell the user and
-  suggest they verify the ticker symbol.
-- If the user wants to END the conversation (e.g. "bye", "exit", "quit", "stop"),
-  respond ONLY with the exact string: TERMINATE
+r"""Deep-research stock-picking agent built on LangGraph.
+
+Graph (variant of stock_research_langgraph.svg with dynamic dispatch):
+
+  START
+    -> user_query
+    -> query_planner          (produces ResearchPlan: tickers + query_type)
+       |
+       +-- dispatch_research (LangGraph Send):
+       |
+       |   if query_type in {single_ticker, portfolio}:
+       |       for each ticker:
+       |           Send -> fundamentals_agent (ticker)
+       |           Send -> sentiment_agent    (ticker)
+       |           Send -> technical_agent    (ticker)
+       |           Send -> macro_agent        (ticker)
+       |   else (general — no specific stock):
+       |       Send -> sentiment_agent  (topic, no ticker)
+       |       Send -> macro_agent      (topic, no ticker)
+       |       (fundamentals + technical are SKIPPED)
+       v
+    -> aggregator
+    -> critic ---(gather_more)--> query_planner   # evidence loop
+              \--(sufficient)--> risk
+                                 -> synthesis
+                                    -> human_review ---(revise)--> synthesis
+                                                  \--(approve)--> final_report
+                                                                  -> END
+
+Per-dimension state slots are Dict[ticker, Finding] (or {"MARKET": Finding} for
+general queries) with a merge reducer so parallel Send invocations don't clobber
+one another. Each slot is a Pydantic model defined in schemas.py.
 """
 
+# Silence third-party noise (yfinance HTTP 404s, urllib3, etc.) BEFORE those
+# modules are imported, so their loggers inherit the muted level.
+import logging
+import warnings
+for _noisy in ("yfinance", "peewee", "urllib3", "urllib3.connectionpool",
+               "requests", "httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# ── Agent Node ───────────────────────────────────────────────────────────────
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
+from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.types import Command, Send, interrupt
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.rule import Rule
+from rich.table import Table
+import httpx
+import os
 
-def my_agent(state: AgentState) -> AgentState:
-    # ── Greeting on first entry ───────────────────────────────────────────────
-    if not state["messages"]:
-        greeting = AIMessage(content=(
-            "👋 Hello! I'm your AI Financial Analyst.\n\n"
-            "I can help you with:\n"
-            "  📰 Latest news & sentiment for any stock (Finnhub)\n"
-            "  📊 Financial statements — income, balance sheet, cash flow (FMP)\n"
-            "  🎯 Analyst ratings & price targets (FMP)\n"
-            "  📈 Key metrics — valuation, profitability, dividends (FMP)\n"
-            "  📉 Technical indicators — RSI, SMA, EMA, MACD, ADX (FMP)\n\n"
-            "Just tell me a ticker symbol or company name to get started.\n"
-            "Type 'exit' or 'bye' to end the session."
-        ))
-        print(f"\n🤖 AI: {greeting.content}")
-        return {"messages": [greeting]}
-
-    system_msg = SystemMessage(content=SYSTEM_PROMPT)
-
-    # ── After tool execution: invoke LLM with full context ────────────────────
-    # The LLM may respond with plain text OR trigger another tool call.
-    # should_continue() handles both cases — no printing here so we don't
-    # print intermediate tool-chaining responses that have no content.
-    if isinstance(state["messages"][-1], ToolMessage):
-        response = model.invoke([system_msg] + list(state["messages"]))
-        # Only print if the model produced a visible reply (not a silent tool call)
-        if response.content and not (hasattr(response, "tool_calls") and response.tool_calls):
-            print(f"\n🤖 AI: {response.content}")
-        return {"messages": [response]}
-
-    # ── Normal user turn: collect input then invoke ───────────────────────────
-    user_input   = input("\n👤 You: ").strip()
-    user_message = HumanMessage(content=user_input)
-
-    all_messages = [system_msg] + list(state["messages"]) + [user_message]
-    response     = model.invoke(all_messages)
-
-    # Only print if this is a direct reply, not a tool-dispatch message
-    if response.content and not (hasattr(response, "tool_calls") and response.tool_calls):
-        print(f"\n🤖 AI: {response.content}")
-
-    return {"messages": [user_message, response]}
-
-
-# ── Routing ──────────────────────────────────────────────────────────────────
-
-def should_continue(state: AgentState) -> str:
-    last = state["messages"][-1]
-
-    if isinstance(last, AIMessage):
-        # Tool call present → dispatch to tools regardless of where we came from
-        if hasattr(last, "tool_calls") and last.tool_calls:
-            names = [tc["name"] for tc in last.tool_calls]
-            print(f"\n🔧 Calling tools: {names}")
-            return "tools"
-
-        # Termination signal
-        if "TERMINATE" in last.content:
-            print("\n👋 Goodbye! Happy investing.")
-            return "end"
-
-    # Otherwise wait for next user input
-    return "agent"
-
-
-# ── Graph ────────────────────────────────────────────────────────────────────
-
-workflow = StateGraph(AgentState)
-
-workflow.add_node("agent", my_agent)
-workflow.add_node("tools", tool_node)
-
-workflow.set_entry_point("agent")
-
-workflow.add_conditional_edges(
-    "agent",
-    should_continue,
-    {
-        "tools": "tools",
-        "agent": "agent",
-        "end":   END,
-    },
+from schemas import (
+    MARKET_KEY,
+    CriticDecision,
+    FinalReport,
+    FundamentalsFindings,
+    Holding,
+    HumanReview,
+    InvestmentThesis,
+    KeyMetric,
+    MacroFindings,
+    ResearchPlan,
+    RiskAssessment,
+    SentimentFindings,
+    TechnicalFindings,
+    TickerRecommendation,
+    TickerRisk,
+)
+from tools import (
+    FUNDAMENTAL_TOOLS,
+    MACRO_TOOLS,
+    SENTIMENT_TOOLS,
+    TECHNICAL_TOOLS,
 )
 
-workflow.add_edge("tools", "agent")
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
 
-graph = workflow.compile()
+MAX_RESEARCH_ITERATIONS = 2   # caps the critic -> planner loop
+MAX_REVISION_ITERATIONS = 2   # caps the human -> synthesis loop
+
+# Shared httpx client to bypass corporate proxy/firewall (matches sample pattern)
+_http = httpx.Client(verify=False)
 
 
-# ── Entry Point ──────────────────────────────────────────────────────────────
+def _llm(model: str = "gpt-4o-mini", temperature: float = 0.1) -> ChatOpenAI:
+    return ChatOpenAI(
+        model=model,
+        temperature=temperature,
+        http_client=_http,
+        api_key=api_key,
+    )
+
+
+# ---------- State ----------
+
+def _merge_findings(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Reducer for per-dimension finding dicts. Later writes overwrite earlier
+    entries for the same ticker; new tickers are added."""
+    if not a:
+        return b or {}
+    if not b:
+        return a
+    return {**a, **b}
+
+
+class State(TypedDict, total=False):
+    messages: Annotated[List[BaseMessage], add_messages]
+    user_query: str
+    research_plan: Optional[ResearchPlan]
+    fundamentals: Annotated[Dict[str, FundamentalsFindings], _merge_findings]
+    sentiment:    Annotated[Dict[str, SentimentFindings],    _merge_findings]
+    technical:    Annotated[Dict[str, TechnicalFindings],    _merge_findings]
+    macro:        Annotated[Dict[str, MacroFindings],        _merge_findings]
+    critic: Optional[CriticDecision]
+    research_iterations: int
+    risk: Optional[RiskAssessment]
+    thesis: Optional[InvestmentThesis]
+    human_review: Optional[HumanReview]
+    revision_iterations: int
+    final_report: Optional[FinalReport]
+
+
+# ---------- Sub-agent helper ----------
+
+def _run_subagent(prompt: str, tools: list, schema, model: str = "gpt-4o-mini"):
+    """Spin up a ReAct sub-agent with a curated tool set, then extract a
+    schema-validated finding from its final answer."""
+    agent = create_agent(_llm(model=model), tools=tools)
+    result = agent.invoke({"messages": [HumanMessage(content=prompt)]})
+    raw_text = result["messages"][-1].content
+    extractor = _llm(model=model, temperature=0).with_structured_output(schema)
+    return extractor.invoke([
+        SystemMessage(content="Extract a structured finding from the research notes."),
+        HumanMessage(content=raw_text),
+    ])
+
+
+# ---------- Nodes ----------
+
+def user_query_node(state: State) -> State:
+    """Entry node: surface the user's question into the message stream."""
+    return {"messages": [HumanMessage(content=state["user_query"])]}
+
+
+def query_planner_node(state: State) -> State:
+    """Decompose the user query into a structured ResearchPlan.
+
+    Critical instruction to the LLM: only populate `tickers` when a specific
+    stock, ETF, or company is named. Open-ended market queries get query_type
+    'general' with an empty tickers list — the dispatcher will skip the
+    fundamentals & technical agents in that case.
+    """
+    system = (
+        "You are a senior buy-side research lead. Decompose the user's query into a "
+        "structured ResearchPlan.\n\n"
+        "Classify the query as one of:\n"
+        "  - single_ticker : exactly one stock / ETF / company is named\n"
+        "  - portfolio     : multiple specific tickers are named (with or without quantities)\n"
+        "  - general       : NO specific company is named (e.g. 'what stocks will IPO this "
+        "year', 'how is the AI sector doing?')\n\n"
+        "Rules:\n"
+        "1. tickers: list every named symbol exactly. Resolve company names to tickers "
+        "   (e.g. 'Google' -> 'GOOGL', 'Lockheed' -> 'LMT'). For general queries, leave EMPTY.\n"
+        "2. holdings: populate with quantity ONLY if the user states positions "
+        "   (e.g. '3 VOO, 4 GOOGL'). Otherwise empty.\n"
+        "3. topic: REQUIRED for general queries — a short phrase describing the subject "
+        "   (e.g. 'upcoming IPOs in 2025', 'AI sector outlook'). Null otherwise.\n"
+        "4. Questions: 3-5 sharp, decision-relevant questions per applicable dimension.\n"
+        "   For general queries: leave fundamentals_questions and technical_questions EMPTY "
+        "   (those agents will be skipped), but DO populate sentiment_questions and "
+        "   macro_questions about the broader topic.\n"
+    )
+    extra = ""
+    if state.get("critic") and not state["critic"].sufficient:
+        extra = (
+            "\n\nIMPORTANT: a prior research round was judged insufficient. "
+            "Re-plan so the new round closes these specific gaps:\n- "
+            + "\n- ".join(state["critic"].gaps)
+        )
+
+    planner = _llm(temperature=0).with_structured_output(ResearchPlan)
+    plan = planner.invoke([
+        SystemMessage(content=system + extra),
+        HumanMessage(content=state["user_query"]),
+    ])
+    return {"research_plan": plan}
+
+
+# ---- Dispatcher: fan out research work using Send ----
+
+def dispatch_research(state: State):
+    """Conditional edge from query_planner. Returns a list of Send objects so
+    LangGraph fans out per-ticker × per-dimension in parallel."""
+    plan: ResearchPlan = state["research_plan"]
+    sends: List[Send] = []
+
+    if plan.tickers:
+        # Per-ticker fan-out across all 4 dimensions
+        for ticker in plan.tickers:
+            sends.append(Send("fundamentals_agent", {
+                "ticker": ticker,
+                "questions": plan.fundamentals_questions,
+            }))
+            sends.append(Send("sentiment_agent", {
+                "ticker": ticker,
+                "questions": plan.sentiment_questions,
+            }))
+            sends.append(Send("technical_agent", {
+                "ticker": ticker,
+                "questions": plan.technical_questions,
+            }))
+            sends.append(Send("macro_agent", {
+                "ticker": ticker,
+                "questions": plan.macro_questions,
+            }))
+    else:
+        # General / topic query — fundamentals & technical SKIPPED.
+        topic = plan.topic or state["user_query"]
+        sends.append(Send("sentiment_agent", {
+            "ticker": None,
+            "topic": topic,
+            "questions": plan.sentiment_questions,
+        }))
+        sends.append(Send("macro_agent", {
+            "ticker": None,
+            "topic": topic,
+            "questions": plan.macro_questions,
+        }))
+
+    return sends
+
+
+# ---- Research agents: receive a Task dict (from Send), return dict-keyed slot update ----
+
+def fundamentals_node(task: dict) -> State:
+    ticker = task["ticker"]
+    questions = task.get("questions") or [f"General fundamental health of {ticker}"]
+    prompt = (
+        f"You are a fundamentals analyst covering {ticker}.\n"
+        f"Call get_stock_fundamentals and get_earnings_history first, then "
+        f"tavily_web_search for qualitative context (10-K/10-Q commentary, "
+        f"management changes, segment trends). Address each question:\n- "
+        + "\n- ".join(questions)
+        + f"\n\nReturn a finding for ticker '{ticker}': revenue trend, profitability, "
+          "valuation, balance sheet, guidance, key_metrics, summary, confidence (0-1), "
+          "and source URLs."
+    )
+    finding = _run_subagent(prompt, FUNDAMENTAL_TOOLS, FundamentalsFindings)
+    return {"fundamentals": {ticker: finding}}
+
+
+def sentiment_node(task: dict) -> State:
+    ticker = task.get("ticker")
+    questions = task.get("questions") or []
+    if ticker:
+        subject = ticker
+        prompt = (
+            f"You are a news & sentiment analyst covering {ticker}.\n"
+            f"Use tavily_news_search and tavily_web_search to address:\n- "
+            + "\n- ".join(questions)
+            + f"\n\nReturn a finding for ticker '{ticker}': headline summary, analyst "
+              "consensus, average price target if available, social sentiment label, "
+              "notable catalysts, summary, confidence (0-1), source URLs."
+        )
+        key = ticker
+    else:
+        topic = task.get("topic") or "broad market"
+        subject = topic
+        prompt = (
+            f"You are a news & sentiment analyst. The user is asking about: '{topic}'.\n"
+            f"No single ticker is in scope — research the topic broadly using "
+            f"tavily_news_search and tavily_web_search. Address:\n- "
+            + "\n- ".join(questions)
+            + f"\n\nReturn a finding using ticker='{MARKET_KEY}': headline summary, "
+              "analyst consensus on the theme, average price target (null is fine), "
+              "social sentiment, notable catalysts (specific names if discovered), "
+              "summary, confidence (0-1), source URLs."
+        )
+        key = MARKET_KEY
+    finding = _run_subagent(prompt, SENTIMENT_TOOLS, SentimentFindings)
+    return {"sentiment": {key: finding}}
+
+
+def technical_node(task: dict) -> State:
+    ticker = task["ticker"]
+    questions = task.get("questions") or [f"Trend, momentum, and key levels for {ticker}"]
+    prompt = (
+        f"You are a technical analyst covering {ticker}.\n"
+        f"Call get_price_history (period='6mo') and get_stock_quote. Address:\n- "
+        + "\n- ".join(questions)
+        + f"\n\nReturn a finding for ticker '{ticker}': current price, trend, moving "
+          "averages commentary, RSI, volume profile, support/resistance, momentum "
+          "signal, summary, confidence (0-1)."
+    )
+    finding = _run_subagent(prompt, TECHNICAL_TOOLS, TechnicalFindings)
+    return {"technical": {ticker: finding}}
+
+
+def macro_node(task: dict) -> State:
+    ticker = task.get("ticker")
+    questions = task.get("questions") or []
+    if ticker:
+        prompt = (
+            f"You are a macro & sector analyst covering {ticker}.\n"
+            f"Use get_peer_comparison and tavily_web_search to address:\n- "
+            + "\n- ".join(questions)
+            + f"\n\nReturn a finding for ticker '{ticker}': sector, industry trends, "
+              "competitor comparison, macro drivers, summary, confidence (0-1), source URLs."
+        )
+        key = ticker
+    else:
+        topic = task.get("topic") or "broad market"
+        prompt = (
+            f"You are a macro & sector analyst. The user is asking about: '{topic}'.\n"
+            f"Research the topic broadly using tavily_web_search. Address:\n- "
+            + "\n- ".join(questions)
+            + f"\n\nReturn a finding using ticker='{MARKET_KEY}': the most relevant "
+              "sector, industry trends, competitor / peer landscape, macro drivers, "
+              "summary, confidence (0-1), source URLs."
+        )
+        key = MARKET_KEY
+    finding = _run_subagent(prompt, MACRO_TOOLS, MacroFindings)
+    return {"macro": {key: finding}}
+
+
+def aggregator_node(state: State) -> State:
+    """Synchronisation point after parallel research. Bumps the loop counter."""
+    return {"research_iterations": state.get("research_iterations", 0) + 1}
+
+
+# ---- Helpers to assemble multi-ticker payloads ----
+
+def _findings_block(label: str, findings: Dict[str, Any]) -> str:
+    if not findings:
+        return f"{label}: (none)\n"
+    parts = [f"=== {label} ==="]
+    for key, f in findings.items():
+        parts.append(f"[{key}]\n{f.model_dump_json(indent=2)}")
+    return "\n".join(parts) + "\n"
+
+
+def _all_findings_payload(state: State) -> str:
+    return (
+        _findings_block("FUNDAMENTALS", state.get("fundamentals") or {})
+        + _findings_block("SENTIMENT",   state.get("sentiment")    or {})
+        + _findings_block("TECHNICAL",   state.get("technical")    or {})
+        + _findings_block("MACRO",       state.get("macro")        or {})
+    )
+
+
+def critic_node(state: State) -> State:
+    """Investment-committee chair: is the evidence decision-ready?"""
+    plan: ResearchPlan = state["research_plan"]
+    system = (
+        "You are a skeptical investment-committee chair. Evaluate the research findings "
+        "(possibly across multiple tickers) for completeness, internal consistency, and "
+        "decision-readiness. Mark sufficient=false if any dimension for any ticker has "
+        "confidence < 0.6, unanswered plan questions, missing data, or contradictions. "
+        "List specific gaps when not sufficient (cite ticker + dimension)."
+    )
+    payload = (
+        f"USER QUERY: {state['user_query']}\n"
+        f"QUERY TYPE: {plan.query_type}\n"
+        f"TICKERS: {plan.tickers or '(none — general query)'}\n\n"
+        + _all_findings_payload(state)
+    )
+    judge = _llm(temperature=0).with_structured_output(CriticDecision)
+    return {"critic": judge.invoke([SystemMessage(content=system), HumanMessage(content=payload)])}
+
+
+def risk_node(state: State) -> State:
+    plan: ResearchPlan = state["research_plan"]
+    system = (
+        "You are a risk officer. Build a risk assessment from the assembled research. "
+        "Cover volatility, drawdown, financial leverage, business concentration, and "
+        "macro risk. For multi-ticker analyses, also populate per_ticker_risks with one "
+        "entry per ticker. Give an overall risk rating that reflects the full set."
+    )
+    payload = (
+        f"QUERY TYPE: {plan.query_type}\nTICKERS: {plan.tickers}\n\n"
+        + _all_findings_payload(state)
+    )
+    risk_llm = _llm(temperature=0.1).with_structured_output(RiskAssessment)
+    return {"risk": risk_llm.invoke([SystemMessage(content=system), HumanMessage(content=payload)])}
+
+
+def synthesis_node(state: State) -> State:
+    """Portfolio-manager voice: integrate research + risk into a thesis."""
+    plan: ResearchPlan = state["research_plan"]
+    is_general = plan.query_type == "general"
+    system = (
+        "You are a portfolio manager writing an investment thesis. Integrate the research "
+        "and risk assessment into a structured InvestmentThesis.\n\n"
+        "Rules:\n"
+        "- For single_ticker queries: produce a clear primary_recommendation and one "
+        "  per_ticker_recommendations entry. Populate bull_case, bear_case, key_risks, "
+        "  and catalysts.\n"
+        "- For portfolio queries: produce per_ticker_recommendations for EVERY ticker. "
+        "  primary_recommendation summarises the portfolio (use 'Mixed' if recs diverge). "
+        "  Populate bull_case, bear_case, key_risks, and catalysts.\n"
+        "- For general (ticker-less) queries: this is an informational question, NOT an "
+        "  investment recommendation. Set primary_recommendation='N/A', leave "
+        "  per_ticker_recommendations empty (unless specific tickers were surfaced worth "
+        "  flagging), and leave bull_case AND bear_case as EMPTY lists. Use thesis_summary "
+        "  to directly answer the user's question using the research findings. Populate "
+        "  key_risks and catalysts only if genuinely relevant to the topic; otherwise "
+        "  leave them empty.\n"
+        "- Be specific, avoid hedge-everywhere prose."
+    )
+    revision_note = ""
+    if state.get("human_review") and state["human_review"].decision == "revise":
+        revision_note = (
+            f"\n\nREVISION FEEDBACK FROM INVESTOR (address explicitly):\n"
+            f"{state['human_review'].feedback}"
+        )
+
+    holdings_str = ""
+    if plan.holdings:
+        holdings_str = "\nHOLDINGS (quantities):\n" + "\n".join(
+            f"  {h.ticker}: {h.quantity}" for h in plan.holdings
+        )
+
+    payload = (
+        f"USER QUERY: {state['user_query']}\n"
+        f"QUERY TYPE: {plan.query_type}\nTICKERS: {plan.tickers}{holdings_str}\n\n"
+        + _all_findings_payload(state)
+        + f"\nRISK:\n{state['risk'].model_dump_json(indent=2)}{revision_note}"
+    )
+    pm = _llm(model="gpt-4o", temperature=0.2).with_structured_output(InvestmentThesis)
+    return {"thesis": pm.invoke([SystemMessage(content=system), HumanMessage(content=payload)])}
+
+
+def human_review_node(state: State) -> State:
+    """Pause the graph for investor approval (LangGraph interrupt)."""
+    thesis: InvestmentThesis = state["thesis"]
+    risk: RiskAssessment = state["risk"]
+    plan: ResearchPlan = state["research_plan"]
+    payload = {
+        "query_type": plan.query_type,
+        "tickers": plan.tickers,
+        "primary_recommendation": thesis.primary_recommendation,
+        "overall_conviction": thesis.overall_conviction,
+        "per_ticker_recommendations": [
+            r.model_dump() for r in thesis.per_ticker_recommendations
+        ],
+        "thesis_summary": thesis.thesis_summary,
+        "bull_case": thesis.bull_case,
+        "bear_case": thesis.bear_case,
+        "key_risks": thesis.key_risks,
+        "overall_risk_rating": risk.overall_risk_rating,
+        "is_general": plan.query_type == "general",
+        "instruction": (
+            "Resume with {'decision': 'approve'} to finalise, or "
+            "{'decision': 'revise', 'feedback': '<what to change>'} to iterate."
+        ),
+    }
+    response = interrupt(payload)
+    review = HumanReview.model_validate(response)
+    return {
+        "human_review": review,
+        "revision_iterations": state.get("revision_iterations", 0)
+        + (1 if review.decision == "revise" else 0),
+    }
+
+
+def final_report_node(state: State) -> State:
+    plan: ResearchPlan = state["research_plan"]
+    if plan.query_type == "general":
+        system = (
+            "You are a senior research editor. The user asked an informational question, "
+            "NOT for an investment recommendation. Produce a polished markdown report that "
+            "DIRECTLY answers the question using the research findings.\n\n"
+            "Do NOT include bull case, bear case, buy/sell recommendations, or per-ticker "
+            "calls unless the research specifically surfaced names worth flagging.\n\n"
+            "Sections: headline, executive summary (the answer), supporting details with "
+            "specific names / dates / sources from the research, and (only if relevant) a "
+            "brief note on risks or caveats. Set primary_recommendation to 'N/A'."
+        )
+    else:
+        system = (
+            "You are a senior equity-research editor. Produce a polished, investor-ready "
+            "markdown report. Sections: headline, executive summary, detailed thesis, "
+            "per-ticker breakdown (one subsection per ticker if multiple), evidence by "
+            "dimension, risk disclosures, and the final recommendation(s). Be specific."
+        )
+    payload = (
+        f"USER QUERY: {state['user_query']}\nQUERY TYPE: {plan.query_type}\n"
+        f"TICKERS: {plan.tickers}\n\n"
+        f"THESIS:\n{state['thesis'].model_dump_json(indent=2)}\n\n"
+        f"RISK:\n{state['risk'].model_dump_json(indent=2)}\n\n"
+        + _all_findings_payload(state)
+    )
+    editor = _llm(model="gpt-4o", temperature=0.2).with_structured_output(FinalReport)
+    report = editor.invoke([SystemMessage(content=system), HumanMessage(content=payload)])
+    return {
+        "final_report": report,
+        "messages": [SystemMessage(content=report.full_markdown)],
+    }
+
+
+# ---------- Conditional routers ----------
+
+def critic_router(state: State) -> str:
+    if state["critic"].sufficient:
+        return "sufficient"
+    if state.get("research_iterations", 0) >= MAX_RESEARCH_ITERATIONS:
+        return "sufficient"  # bail out rather than spin forever
+    return "gather_more"
+
+
+def human_router(state: State) -> str:
+    review = state.get("human_review")
+    if review is None or review.decision == "approve":
+        return "approve"
+    if state.get("revision_iterations", 0) >= MAX_REVISION_ITERATIONS:
+        return "approve"
+    return "revise"
+
+
+# ---------- Build the graph ----------
+
+RESEARCH_NODES = ["fundamentals_agent", "sentiment_agent", "technical_agent", "macro_agent"]
+
+
+def build_graph():
+    graph = StateGraph(State)
+
+    graph.add_node("user_query", user_query_node)
+    graph.add_node("query_planner", query_planner_node)
+    graph.add_node("fundamentals_agent", fundamentals_node)
+    graph.add_node("sentiment_agent", sentiment_node)
+    graph.add_node("technical_agent", technical_node)
+    graph.add_node("macro_agent", macro_node)
+    graph.add_node("aggregator", aggregator_node)
+    graph.add_node("critic", critic_node)
+    graph.add_node("risk", risk_node)
+    graph.add_node("synthesis", synthesis_node)
+    graph.add_node("human_review", human_review_node)
+    graph.add_node("final_report", final_report_node)
+
+    graph.add_edge(START, "user_query")
+    graph.add_edge("user_query", "query_planner")
+
+    # Dynamic fan-out via Send (per-ticker × per-dimension, or topic-only for general)
+    graph.add_conditional_edges("query_planner", dispatch_research, RESEARCH_NODES)
+    for node in RESEARCH_NODES:
+        graph.add_edge(node, "aggregator")
+
+    graph.add_edge("aggregator", "critic")
+    graph.add_conditional_edges(
+        "critic",
+        critic_router,
+        {"sufficient": "risk", "gather_more": "query_planner"},
+    )
+
+    graph.add_edge("risk", "synthesis")
+    graph.add_edge("synthesis", "human_review")
+    graph.add_conditional_edges(
+        "human_review",
+        human_router,
+        {"approve": "final_report", "revise": "synthesis"},
+    )
+    graph.add_edge("final_report", END)
+
+    # Register all Pydantic schemas explicitly with the checkpoint serializer
+    # to silence "unregistered type" warnings and stay forward-compatible.
+    serde = JsonPlusSerializer(allowed_msgpack_modules=[
+        ResearchPlan,
+        Holding,
+        FundamentalsFindings,
+        KeyMetric,
+        SentimentFindings,
+        TechnicalFindings,
+        MacroFindings,
+        CriticDecision,
+        RiskAssessment,
+        TickerRisk,
+        InvestmentThesis,
+        TickerRecommendation,
+        HumanReview,
+        FinalReport,
+    ])
+    return graph.compile(checkpointer=MemorySaver(serde=serde))
+
+
+app = build_graph()
+
+
+# ---------- Pretty terminal rendering (rich) ----------
+
+console = Console()
+
+NODE_STYLE = {
+    "query_planner":      ("Query Planner",                "blue"),
+    "fundamentals_agent": ("Fundamentals Agent",           "yellow"),
+    "sentiment_agent":    ("News & Sentiment Agent",       "magenta"),
+    "technical_agent":    ("Technical Analysis Agent",     "green"),
+    "macro_agent":        ("Macro & Sector Agent",         "cyan"),
+    "aggregator":         ("Aggregator",                   "cyan"),
+    "critic":             ("Critic",                       "yellow"),
+    "risk":               ("Risk Assessment",              "red"),
+    "synthesis":          ("Synthesis & Thesis",           "magenta"),
+    "final_report":       ("Final Report",                 "green"),
+}
+
+
+def _format_payload(node: str, payload: dict):
+    if node == "query_planner":
+        plan: Optional[ResearchPlan] = payload.get("research_plan")
+        if not plan:
+            return None
+        t = Table(show_header=False, box=None, padding=(0, 1))
+        t.add_column(style="bold")
+        t.add_column()
+        t.add_row("Query type", plan.query_type)
+        t.add_row("Tickers", ", ".join(plan.tickers) if plan.tickers else "(none — general query)")
+        if plan.holdings:
+            t.add_row("Holdings", ", ".join(f"{h.quantity:g} {h.ticker}" for h in plan.holdings))
+        if plan.topic:
+            t.add_row("Topic", plan.topic)
+        t.add_row("Horizon", plan.investor_horizon)
+        t.add_row("Questions",
+                  f"fund ({len(plan.fundamentals_questions)})  "
+                  f"sent ({len(plan.sentiment_questions)})  "
+                  f"tech ({len(plan.technical_questions)})  "
+                  f"macro ({len(plan.macro_questions)})")
+        return t
+
+    if node == "fundamentals_agent":
+        d = payload.get("fundamentals") or {}
+        if not d:
+            return None
+        ticker, f = next(iter(d.items()))
+        return (f"[bold]Ticker:[/] {ticker}\n"
+                f"[bold]Summary:[/] {f.summary}\n"
+                f"[bold]Valuation:[/] {f.valuation}\n"
+                f"[bold]Confidence:[/] {f.confidence:.2f}")
+
+    if node == "sentiment_agent":
+        d = payload.get("sentiment") or {}
+        if not d:
+            return None
+        key, s = next(iter(d.items()))
+        return (f"[bold]Subject:[/] {key}\n"
+                f"[bold]Social sentiment:[/] {s.social_sentiment}\n"
+                f"[bold]Analyst consensus:[/] {s.analyst_consensus}\n"
+                f"[bold]Headlines:[/] {s.headline_summary}\n"
+                f"[bold]Confidence:[/] {s.confidence:.2f}")
+
+    if node == "technical_agent":
+        d = payload.get("technical") or {}
+        if not d:
+            return None
+        ticker, t = next(iter(d.items()))
+        price = f"${t.current_price:.2f}" if t.current_price else "n/a"
+        rsi = f"{t.rsi:.1f}" if t.rsi else "n/a"
+        return (f"[bold]Ticker:[/] {ticker}\n"
+                f"[bold]Trend:[/] {t.trend}   [bold]Momentum:[/] {t.momentum_signal}\n"
+                f"[bold]Price:[/] {price}   [bold]RSI14:[/] {rsi}\n"
+                f"[bold]Summary:[/] {t.summary}\n"
+                f"[bold]Confidence:[/] {t.confidence:.2f}")
+
+    if node == "macro_agent":
+        d = payload.get("macro") or {}
+        if not d:
+            return None
+        key, m = next(iter(d.items()))
+        return (f"[bold]Subject:[/] {key}\n"
+                f"[bold]Sector:[/] {m.sector}\n"
+                f"[bold]Industry:[/] {m.industry_trends}\n"
+                f"[bold]Summary:[/] {m.summary}\n"
+                f"[bold]Confidence:[/] {m.confidence:.2f}")
+
+    if node == "aggregator":
+        return f"Research round [bold]{payload.get('research_iterations')}[/] complete."
+
+    if node == "critic":
+        c = payload.get("critic")
+        if not c:
+            return None
+        verdict = "[bold green]SUFFICIENT[/]" if c.sufficient else "[bold yellow]NEEDS MORE[/]"
+        body = f"[bold]Verdict:[/] {verdict}\n[bold]Rationale:[/] {c.rationale}"
+        if c.gaps:
+            body += "\n[bold]Gaps:[/]\n  - " + "\n  - ".join(c.gaps)
+        return body
+
+    if node == "risk":
+        r = payload.get("risk")
+        if not r:
+            return None
+        body = (f"[bold]Overall risk:[/] [bold red]{r.overall_risk_rating}[/]\n"
+                f"[bold]Summary:[/] {r.summary}")
+        if r.per_ticker_risks:
+            body += "\n[bold]Per ticker:[/]\n" + "\n".join(
+                f"  - {pr.ticker}: [red]{pr.risk_rating}[/]"
+                for pr in r.per_ticker_risks
+            )
+        return body
+
+    if node == "synthesis":
+        th = payload.get("thesis")
+        if not th:
+            return None
+        is_general = th.primary_recommendation == "N/A"
+        if is_general:
+            body = f"[bold]Answer:[/] {th.thesis_summary}"
+        else:
+            body = (f"[bold]Recommendation:[/] [bold]{th.primary_recommendation}[/]   "
+                    f"[bold]Conviction:[/] {th.overall_conviction}\n"
+                    f"[bold]Thesis:[/] {th.thesis_summary}")
+        if th.per_ticker_recommendations:
+            body += "\n[bold]Per ticker:[/]\n" + "\n".join(
+                f"  - {r.ticker}: [bold]{r.recommendation}[/] ({r.conviction}) — {r.rationale}"
+                for r in th.per_ticker_recommendations
+            )
+        return body
+
+    if node == "final_report":
+        fr = payload.get("final_report")
+        if not fr:
+            return None
+        return f"[bold]Headline:[/] {fr.headline}\n[dim]Full report rendered below.[/]"
+
+    return None
+
+
+def render_node_update(node: str, payload):
+    if node == "__interrupt__" or node == "user_query":
+        return
+    if not isinstance(payload, dict):
+        return
+    spec = NODE_STYLE.get(node)
+    if not spec:
+        return
+    title, color = spec
+    body = _format_payload(node, payload)
+    if body is None:
+        return
+    # For per-ticker agents, append the ticker to the panel title.
+    suffix = ""
+    for slot in ("fundamentals", "sentiment", "technical", "macro"):
+        d = payload.get(slot)
+        if d:
+            keys = list(d.keys())
+            if len(keys) == 1:
+                suffix = f"  -  {keys[0]}"
+            break
+    console.print(Panel(body, title=f"[bold {color}]{title}[/]{suffix}",
+                        border_style=color, expand=True))
+
+
+def prompt_human(payload: dict) -> dict:
+    """Interactive human-in-the-loop review prompt."""
+    console.print(Rule(title="[bold yellow]Investor Review Required[/]", style="yellow"))
+
+    summary = Table(show_header=False, box=None, padding=(0, 1))
+    summary.add_column(style="bold")
+    summary.add_column()
+    summary.add_row("Query type", str(payload.get("query_type")))
+    tickers = payload.get("tickers") or []
+    summary.add_row("Tickers", ", ".join(tickers) if tickers else "(general query)")
+    summary.add_row("Recommendation", f"[bold]{payload.get('primary_recommendation')}[/]")
+    summary.add_row("Conviction", str(payload.get("overall_conviction")))
+    summary.add_row("Risk rating", str(payload.get("overall_risk_rating")))
+    console.print(Panel(summary, border_style="yellow"))
+
+    per_ticker = payload.get("per_ticker_recommendations") or []
+    if per_ticker:
+        tbl = Table(title="Per-ticker recommendations", title_style="bold yellow")
+        tbl.add_column("Ticker", style="bold")
+        tbl.add_column("Recommendation", style="bold")
+        tbl.add_column("Conviction")
+        tbl.add_column("Rationale", overflow="fold")
+        for r in per_ticker:
+            tbl.add_row(str(r.get("ticker")), str(r.get("recommendation")),
+                        str(r.get("conviction")), str(r.get("rationale")))
+        console.print(tbl)
+
+    console.print(f"\n[bold]Answer:[/] {payload.get('thesis_summary')}\n"
+                  if payload.get("is_general")
+                  else f"\n[bold]Thesis:[/] {payload.get('thesis_summary')}\n")
+
+    def _bullets(items, style):
+        if not items:
+            return f"[{style}]  (none)[/]"
+        return "\n".join(f"[{style}]  - {it}[/]" for it in items)
+
+    # Skip bull/bear case sections for general informational queries.
+    if not payload.get("is_general"):
+        console.print("[bold green]Bull case[/]")
+        console.print(_bullets(payload.get("bull_case", []), "green"))
+        console.print("\n[bold red]Bear case[/]")
+        console.print(_bullets(payload.get("bear_case", []), "red"))
+
+    if payload.get("key_risks"):
+        console.print("\n[bold yellow]Key risks[/]")
+        console.print(_bullets(payload.get("key_risks", []), "yellow"))
+    console.print()
+
+    decision = Prompt.ask(
+        "[bold]Approve the thesis or request a revision?[/]",
+        choices=["approve", "revise"],
+        default="approve",
+    )
+    if decision == "revise":
+        feedback = Prompt.ask("[yellow]What would you like changed?[/]")
+        return {"decision": "revise", "feedback": feedback}
+    return {"decision": "approve"}
+
+
+# ---------- Interactive runner ----------
+
+def run_research(query: str, config: dict) -> None:
+    """Stream the graph for one user query, handling interrupts interactively."""
+    inputs = {
+        "user_query": query,
+        "research_iterations": 0,
+        "revision_iterations": 0,
+        "fundamentals": {},
+        "sentiment": {},
+        "technical": {},
+        "macro": {},
+    }
+
+    # Text shown on the spinner WHILE the next step is being generated.
+    # Indexed by the node that just completed (so we describe what's coming).
+    next_step_message = {
+        "user_query":         "Planning research...",
+        "query_planner":      "Dispatching research agents...",
+        "fundamentals_agent": "Gathering research findings...",
+        "sentiment_agent":    "Gathering research findings...",
+        "technical_agent":    "Gathering research findings...",
+        "macro_agent":        "Gathering research findings...",
+        "aggregator":         "Critiquing evidence...",
+        "critic":             "Assessing risk...",
+        "risk":               "Synthesising thesis...",
+        "synthesis":          "Awaiting investor review...",
+        "human_review":       "Generating final report...",
+        "final_report":       "Wrapping up...",
+    }
+
+    resume_value = None
+    first = True
+
+    while True:
+        if first:
+            stream_input = inputs
+            current_status = "Planning research..."
+            first = False
+        else:
+            stream_input = Command(resume=resume_value)
+            current_status = (
+                "Revising thesis..."
+                if resume_value.get("decision") == "revise"
+                else "Generating final report..."
+            )
+
+        with console.status(f"[dim]{current_status}[/]", spinner="dots") as status:
+            for event in app.stream(stream_input, config=config, stream_mode="updates"):
+                for node, payload in event.items():
+                    render_node_update(node, payload)
+                    msg = next_step_message.get(node)
+                    if msg:
+                        status.update(f"[dim]{msg}[/]")
+
+        snapshot = app.get_state(config)
+        pending = [t for t in snapshot.tasks if t.interrupts]
+        if not pending:
+            break
+        resume_value = prompt_human(pending[0].interrupts[0].value)
+
+    final = app.get_state(config).values.get("final_report")
+    if final:
+        console.print(Rule(title="[bold green]Final Recommendation Report[/]", style="green"))
+        console.print(Markdown(final.full_markdown))
+        console.print(Rule(style="green"))
+
+
+def main() -> None:
+    console.print(Rule(title="[bold blue]Deep Research Stock Picker[/]", style="blue"))
+    console.print(
+        "[dim]Ask any investment question. Examples:\n"
+        "  - 'Is TSLA a buy for the next year?' (single ticker)\n"
+        "  - 'Analyse my positions: 3 VOO, 4 GOOGL, 7 NVDA, 2 JPM' (portfolio)\n"
+        "  - 'What stocks are going to IPO this year?' (general — no ticker)\n"
+        "Type 'exit' to quit.[/]\n"
+    )
+
+    session = 0
+    while True:
+        session += 1
+        try:
+            query = Prompt.ask("[bold cyan]Question[/]").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Goodbye.[/]")
+            return
+        if not query:
+            continue
+        if query.lower() in ("exit", "quit", "q"):
+            console.print("[dim]Goodbye.[/]")
+            return
+
+        config = {"configurable": {"thread_id": f"session-{session}"}}
+        try:
+            run_research(query, config)
+        except Exception:
+            console.print_exception()
+        console.print()
+
 
 if __name__ == "__main__":
-    print("🚀 Financial Analyst Agent started  (type 'exit' or 'bye' to quit)\n")
-    graph.invoke({"messages": []})
+    main()
