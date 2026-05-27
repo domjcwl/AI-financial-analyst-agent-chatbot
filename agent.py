@@ -1,23 +1,19 @@
 r"""Deep-research stock-picking agent built on LangGraph.
 
-Graph (variant of stock_research_langgraph.svg with dynamic dispatch):
+Graph (multi-item dispatch):
 
   START
     -> user_query
-    -> query_planner          (produces ResearchPlan: tickers + query_type)
+    -> query_planner          (produces ResearchPlan: list of QueryItems)
        |
        +-- dispatch_research (LangGraph Send):
-       |
-       |   if query_type in {single_ticker, portfolio}:
-       |       for each ticker:
-       |           Send -> fundamentals_agent (ticker)
-       |           Send -> sentiment_agent    (ticker)
-       |           Send -> technical_agent    (ticker)
-       |           Send -> macro_agent        (ticker)
-       |   else (general — no specific stock):
-       |       Send -> sentiment_agent  (topic, no ticker)
-       |       Send -> macro_agent      (topic, no ticker)
-       |       (fundamentals + technical are SKIPPED)
+       |     for each item in plan.items:
+       |       if item.query_type == "stock_analysis":
+       |           Send -> fundamentals_agent / sentiment_agent /
+       |                   technical_agent     / macro_agent      (target=ticker)
+       |       elif item.query_type == "industry_analysis":
+       |           Send -> sentiment_agent / macro_agent          (target=industry)
+       |           (fundamentals + technical are SKIPPED)
        v
     -> aggregator
     -> critic ---(gather_more)--> query_planner   # evidence loop
@@ -27,9 +23,13 @@ Graph (variant of stock_research_langgraph.svg with dynamic dispatch):
                                                   \--(approve)--> final_report
                                                                   -> END
 
-Per-dimension state slots are Dict[ticker, Finding] (or {"MARKET": Finding} for
-general queries) with a merge reducer so parallel Send invocations don't clobber
-one another. Each slot is a Pydantic model defined in schemas.py.
+Per-dimension state slots are Dict[target, Finding] (target = ticker for stock
+items, industry name for industry items) with a merge reducer so parallel Send
+invocations don't clobber one another. Each slot is a Pydantic model defined in
+schemas.py.
+
+The CLI / Rich rendering layer lives in cli.py; this module only defines the
+graph and exposes `app` and `build_graph()` for import.
 """
 
 # Silence third-party noise (yfinance HTTP 404s, urllib3, etc.) BEFORE those
@@ -44,38 +44,31 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 from dotenv import load_dotenv
 from langchain.agents import create_agent
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Command, Send, interrupt
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.prompt import Prompt
-from rich.rule import Rule
-from rich.table import Table
 import httpx
 import os
 
 from schemas import (
-    MARKET_KEY,
     CriticDecision,
     FinalReport,
     FundamentalsFindings,
     Holding,
     HumanReview,
+    IndustryOutlook,
     InvestmentThesis,
     KeyMetric,
     MacroFindings,
+    QueryItem,
     ResearchPlan,
-    RiskAssessment,
     SentimentFindings,
+    StockOutlook,
     TechnicalFindings,
-    TickerRecommendation,
-    TickerRisk,
 )
 from tools import (
     FUNDAMENTAL_TOOLS,
@@ -87,14 +80,28 @@ from tools import (
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 
+# ---------- Tunables ----------
+
 MAX_RESEARCH_ITERATIONS = 2   # caps the critic -> planner loop
 MAX_REVISION_ITERATIONS = 2   # caps the human -> synthesis loop
+SUBAGENT_RECURSION_LIMIT = 40 # how many ReAct steps a sub-agent may take
+
+# Model tiers. Reasoning nodes (planner, critic, risk, synthesis, final_report)
+# get the larger model because their decisions gate the rest of the workflow.
+# Sub-agents stay on the cheaper model — they're tool-heavy, not reasoning-heavy.
+REASONING_MODEL = "gpt-4o"
+SUBAGENT_MODEL = "gpt-4o-mini"
+EXTRACTOR_MODEL = "gpt-4o-mini"
+
+# Minimum self-rated confidence per dimension below which the critic should
+# treat a finding as insufficient. Mirrored in the critic prompt.
+MIN_DIMENSION_CONFIDENCE = 0.6
 
 # Shared httpx client to bypass corporate proxy/firewall (matches sample pattern)
 _http = httpx.Client(verify=False)
 
 
-def _llm(model: str = "gpt-4o-mini", temperature: float = 0.1) -> ChatOpenAI:
+def _llm(model: str = SUBAGENT_MODEL, temperature: float = 0.1) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
         temperature=temperature,
@@ -107,7 +114,7 @@ def _llm(model: str = "gpt-4o-mini", temperature: float = 0.1) -> ChatOpenAI:
 
 def _merge_findings(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Reducer for per-dimension finding dicts. Later writes overwrite earlier
-    entries for the same ticker; new tickers are added."""
+    entries for the same target; new targets are added."""
     if not a:
         return b or {}
     if not b:
@@ -125,7 +132,6 @@ class State(TypedDict, total=False):
     macro:        Annotated[Dict[str, MacroFindings],        _merge_findings]
     critic: Optional[CriticDecision]
     research_iterations: int
-    risk: Optional[RiskAssessment]
     thesis: Optional[InvestmentThesis]
     human_review: Optional[HumanReview]
     revision_iterations: int
@@ -134,17 +140,86 @@ class State(TypedDict, total=False):
 
 # ---------- Sub-agent helper ----------
 
-def _run_subagent(prompt: str, tools: list, schema, model: str = "gpt-4o-mini"):
+# Universal research discipline injected into every sub-agent's system message.
+# Forces the multi-tool-call, multi-source, citation-required behaviour that
+# distinguishes a real research pass from a one-shot LLM guess.
+_RESEARCH_DISCIPLINE = (
+    "RESEARCH DISCIPLINE — non-negotiable:\n"
+    "1. Call each of your tools AT LEAST ONCE before drafting any answer. Make "
+    "   MULTIPLE calls with different query phrasings when using web/news search.\n"
+    "2. Address EVERY plan question explicitly. If a question cannot be answered "
+    "   from available data, add it to `unanswered_questions` in the finding.\n"
+    "3. Cite SPECIFIC numbers (revenue %, margin %, $ values, RSI, multiples) — "
+    "   not vague qualifiers like 'strong' or 'good'. Pull numbers from tool "
+    "   results, not from memory.\n"
+    "4. Capture every source URL you relied on; the structured-output step will "
+    "   populate `sources`. Deduplicate.\n"
+    "5. Calibrate confidence honestly: 0.8+ requires 3+ sources and all "
+    "   questions answered; 0.5-0.7 for partial coverage; <0.5 when data is "
+    "   sparse, stale, or contradictory.\n"
+    "6. Look for DISCONFIRMING evidence as well as supporting; do not cherry-pick.\n"
+)
+
+
+def _run_subagent(
+    role_system: str,
+    task_prompt: str,
+    tools: list,
+    schema,
+    questions: Optional[List[str]] = None,
+    fallback_factory=None,
+    model: str = SUBAGENT_MODEL,
+):
     """Spin up a ReAct sub-agent with a curated tool set, then extract a
-    schema-validated finding from its final answer."""
+    schema-validated finding from its final answer.
+
+    On failure (tool blow-up, parser error, schema-validation error), returns
+    the result of `fallback_factory()` so downstream nodes still receive a
+    valid Finding instead of crashing the graph. The fallback carries
+    confidence=0 so the critic will route to gather_more.
+    """
+    system_with_discipline = f"{role_system}\n\n{_RESEARCH_DISCIPLINE}"
     agent = create_agent(_llm(model=model), tools=tools)
-    result = agent.invoke({"messages": [HumanMessage(content=prompt)]})
-    raw_text = result["messages"][-1].content
-    extractor = _llm(model=model, temperature=0).with_structured_output(schema)
-    return extractor.invoke([
-        SystemMessage(content="Extract a structured finding from the research notes."),
-        HumanMessage(content=raw_text),
-    ])
+    try:
+        result = agent.invoke(
+            {"messages": [
+                SystemMessage(content=system_with_discipline),
+                HumanMessage(content=task_prompt),
+            ]},
+            config={"recursion_limit": SUBAGENT_RECURSION_LIMIT},
+        )
+        # Prefer the last AI message (the agent's final synthesis); fall back to
+        # whatever the last message is so we never lose what the agent produced.
+        ai_msgs = [m for m in result["messages"] if isinstance(m, AIMessage)]
+        raw_text = ai_msgs[-1].content if ai_msgs else result["messages"][-1].content
+
+        extractor_system = (
+            "Extract a structured finding from the analyst's research notes. "
+            "Preserve specific numbers, multiples, and source URLs verbatim. "
+            "Populate `unanswered_questions` with any plan question that the "
+            "notes did not address. Do not invent data — leave fields empty "
+            "or use a low confidence value when evidence is missing."
+        )
+        if questions:
+            extractor_system += (
+                "\n\nORIGINAL PLAN QUESTIONS — every one must either be answered "
+                "in the finding or appear in `unanswered_questions`:\n- "
+                + "\n- ".join(questions)
+            )
+
+        extractor = _llm(model=EXTRACTOR_MODEL, temperature=0).with_structured_output(schema)
+        return extractor.invoke([
+            SystemMessage(content=extractor_system),
+            HumanMessage(content=raw_text),
+        ])
+    except Exception as exc:
+        if fallback_factory is None:
+            raise
+        logging.getLogger(__name__).warning(
+            "Sub-agent for %s failed: %s — emitting fallback finding.",
+            schema.__name__, exc,
+        )
+        return fallback_factory(str(exc))
 
 
 # ---------- Nodes ----------
@@ -154,47 +229,133 @@ def user_query_node(state: State) -> State:
     return {"messages": [HumanMessage(content=state["user_query"])]}
 
 
+_ALL_DIMS = ("fundamentals", "sentiment", "technical", "macro")
+_STOCK_DIMS = {"fundamentals", "sentiment", "technical", "macro"}
+_INDUSTRY_DIMS = {"sentiment", "macro"}
+
+_DIM_TO_QUESTION_FIELD = {
+    "fundamentals": "fundamentals_questions",
+    "sentiment":    "sentiment_questions",
+    "technical":    "technical_questions",
+    "macro":        "macro_questions",
+}
+
+
+def _valid_dims_for(item: QueryItem) -> set:
+    return _STOCK_DIMS if item.query_type == "stock_analysis" else _INDUSTRY_DIMS
+
+
 def query_planner_node(state: State) -> State:
     """Decompose the user query into a structured ResearchPlan.
 
-    Critical instruction to the LLM: only populate `tickers` when a specific
-    stock, ETF, or company is named. Open-ended market queries get query_type
-    'general' with an empty tickers list — the dispatcher will skip the
-    fundamentals & technical agents in that case.
-    """
-    system = (
-        "You are a senior buy-side research lead. Decompose the user's query into a "
-        "structured ResearchPlan.\n\n"
-        "Classify the query as one of:\n"
-        "  - single_ticker : exactly one stock / ETF / company is named\n"
-        "  - portfolio     : multiple specific tickers are named (with or without quantities)\n"
-        "  - general       : NO specific company is named (e.g. 'what stocks will IPO this "
-        "year', 'how is the AI sector doing?')\n\n"
-        "Rules:\n"
-        "1. tickers: list every named symbol exactly. Resolve company names to tickers "
-        "   (e.g. 'Google' -> 'GOOGL', 'Lockheed' -> 'LMT'). For general queries, leave EMPTY.\n"
-        "2. holdings: populate with quantity ONLY if the user states positions "
-        "   (e.g. '3 VOO, 4 GOOGL'). Otherwise empty.\n"
-        "3. topic: REQUIRED for general queries — a short phrase describing the subject "
-        "   (e.g. 'upcoming IPOs in 2025', 'AI sector outlook'). Null otherwise.\n"
-        "4. Questions: 3-5 sharp, decision-relevant questions per applicable dimension.\n"
-        "   For general queries: leave fundamentals_questions and technical_questions EMPTY "
-        "   (those agents will be skipped), but DO populate sentiment_questions and "
-        "   macro_questions about the broader topic.\n"
-    )
-    extra = ""
-    if state.get("critic") and not state["critic"].sufficient:
-        extra = (
-            "\n\nIMPORTANT: a prior research round was judged insufficient. "
-            "Re-plan so the new round closes these specific gaps:\n- "
-            + "\n- ".join(state["critic"].gaps)
-        )
+    The plan is a LIST of QueryItems. Each item is either:
+      - stock_analysis    (target = ticker, all 4 agents run)
+      - industry_analysis (target = industry label, only sentiment + macro run)
 
-    planner = _llm(temperature=0).with_structured_output(ResearchPlan)
+    On re-runs after an insufficient critic, this node:
+      - locks the items list (query_type + target per item)
+      - asks the LLM to refine questions ONLY for the (target, dimension) pairs
+        the critic flagged
+      - preserves the prior plan's questions for all other (target, dimension)
+        pairs verbatim
+    """
+    previous_plan: Optional[ResearchPlan] = state.get("research_plan")
+    crit = state.get("critic")
+    is_rerun = (
+        crit is not None
+        and not crit.sufficient
+        and previous_plan is not None
+    )
+
+    base_system = (
+        "You are a senior buy-side research lead. Decompose the user's query into a "
+        "ResearchPlan containing one or more QueryItems.\n\n"
+        "There are exactly TWO query types:\n"
+        "  - stock_analysis    : a specific stock / ETF / company is named "
+        "(target = ticker). Runs fundamentals + sentiment + technical + macro.\n"
+        "  - industry_analysis : a sector / industry is referenced without a specific "
+        "company (target = a short canonical industry label). Runs ONLY sentiment + macro.\n\n"
+        "Decomposition rules:\n"
+        "1. ONE item per named stock. Resolve company names to tickers "
+        "   (e.g. 'Google' -> 'GOOGL', 'Lockheed' -> 'LMT'). ETFs are also "
+        "   stock_analysis (e.g. 'XLE', 'VOO', 'SPY').\n"
+        "2. ONE item per named industry / sector. Use a short canonical label "
+        "   (e.g. 'technology', 'healthcare', 'energy', 'financials', "
+        "   'consumer discretionary', 'industrials', 'utilities').\n"
+        "3. A single query MAY contain a mix of both types — produce as many items "
+        "   as the user implied. Examples:\n"
+        "     - 'Analyse NVDA, META, JPM, XLE' -> 4 stock_analysis items.\n"
+        "     - 'Analyse the tech and healthcare industries' -> 2 industry_analysis items.\n"
+        "     - 'Analyse the tech industry and tell me if Google is a buy' -> "
+        "       1 industry_analysis (technology) + 1 stock_analysis (GOOGL).\n"
+        "4. holdings: populate with quantity ONLY if the user states positions "
+        "   (e.g. '3 VOO, 4 GOOGL'). Otherwise empty.\n\n"
+        "Per-item questions (3-5 each):\n"
+        "  - stock_analysis items: populate fundamentals_questions, "
+        "    sentiment_questions, technical_questions, AND macro_questions.\n"
+        "  - industry_analysis items: populate ONLY sentiment_questions and "
+        "    macro_questions. Leave fundamentals_questions and "
+        "    technical_questions EMPTY — those agents will be skipped.\n"
+        "  - Each question must be specific enough that an analyst could answer "
+        "    it with a number or a named source. Avoid open-ended 'how is X doing?'.\n"
+    )
+
+    if is_rerun:
+        gap_dims = set(crit.gap_dimensions) or set(_ALL_DIMS)
+        gap_targets = set(crit.gap_targets) or set(previous_plan.all_targets())
+        item_lines = [
+            f"    - [{i.query_type}] {i.target}" for i in previous_plan.items
+        ]
+        gap_dims_str = ", ".join(sorted(gap_dims))
+        gap_targets_str = ", ".join(sorted(gap_targets))
+        extra = (
+            "\n\nRE-PLAN — narrow scope.\n"
+            "A prior research round was judged insufficient. The plan ITEMS are "
+            "FIXED — do NOT add, remove, or change query_type / target for any item:\n"
+            + "\n".join(item_lines) + "\n\n"
+            f"Refine questions ONLY for items with target in: {gap_targets_str}\n"
+            f"And ONLY for these dimensions: {gap_dims_str}\n\n"
+            "Leave question lists EMPTY for any (item, dimension) combination not "
+            "in the refine set — they will be preserved from the prior plan.\n\n"
+            "Gap details to address:\n- " + "\n- ".join(crit.gaps)
+        )
+        system = base_system + extra
+    else:
+        system = base_system
+
+    planner = _llm(model=REASONING_MODEL, temperature=0).with_structured_output(ResearchPlan)
     plan = planner.invoke([
-        SystemMessage(content=system + extra),
+        SystemMessage(content=system),
         HumanMessage(content=state["user_query"]),
     ])
+
+    if is_rerun:
+        # Lock items + selectively merge questions per (target, dim). For each
+        # previous item, if it's in gap_targets, take the NEW questions for any
+        # dim in gap_dims, else keep the previous questions.
+        gap_dims = set(crit.gap_dimensions) or set(_ALL_DIMS)
+        gap_targets = set(crit.gap_targets) or set(previous_plan.all_targets())
+        new_by_target = {i.target: i for i in plan.items}
+
+        merged_items: List[QueryItem] = []
+        for prev in previous_plan.items:
+            if prev.target not in gap_targets:
+                merged_items.append(prev)
+                continue
+            new = new_by_target.get(prev.target)
+            if new is None:
+                merged_items.append(prev)
+                continue
+            updates = {}
+            for dim, field in _DIM_TO_QUESTION_FIELD.items():
+                if dim in gap_dims and dim in _valid_dims_for(prev):
+                    updates[field] = getattr(new, field)
+                else:
+                    updates[field] = getattr(prev, field)
+            merged_items.append(prev.model_copy(update=updates))
+
+        plan = previous_plan.model_copy(update={"items": merged_items})
+
     return {"research_plan": plan}
 
 
@@ -202,137 +363,301 @@ def query_planner_node(state: State) -> State:
 
 def dispatch_research(state: State):
     """Conditional edge from query_planner. Returns a list of Send objects so
-    LangGraph fans out per-ticker × per-dimension in parallel."""
-    plan: ResearchPlan = state["research_plan"]
-    sends: List[Send] = []
+    LangGraph fans out per-item × per-dimension in parallel.
 
-    if plan.tickers:
-        # Per-ticker fan-out across all 4 dimensions
-        for ticker in plan.tickers:
-            sends.append(Send("fundamentals_agent", {
-                "ticker": ticker,
-                "questions": plan.fundamentals_questions,
-            }))
-            sends.append(Send("sentiment_agent", {
-                "ticker": ticker,
-                "questions": plan.sentiment_questions,
-            }))
-            sends.append(Send("technical_agent", {
-                "ticker": ticker,
-                "questions": plan.technical_questions,
-            }))
-            sends.append(Send("macro_agent", {
-                "ticker": ticker,
-                "questions": plan.macro_questions,
-            }))
-    else:
-        # General / topic query — fundamentals & technical SKIPPED.
-        topic = plan.topic or state["user_query"]
-        sends.append(Send("sentiment_agent", {
-            "ticker": None,
-            "topic": topic,
-            "questions": plan.sentiment_questions,
-        }))
-        sends.append(Send("macro_agent", {
-            "ticker": None,
-            "topic": topic,
-            "questions": plan.macro_questions,
-        }))
+    Gap-aware: when re-running after an insufficient critic, only dispatch to
+    the (item, dimension) pairs the critic flagged. Findings from earlier
+    rounds remain in state untouched (merge reducer overwrites only the keys
+    that this round produces).
+    """
+    plan: ResearchPlan = state["research_plan"]
+    crit: Optional[CriticDecision] = state.get("critic")
+    is_rerun = crit is not None and not crit.sufficient
+
+    wanted_dims = set(crit.gap_dimensions) if (is_rerun and crit.gap_dimensions) else None
+    wanted_targets = set(crit.gap_targets) if (is_rerun and crit.gap_targets) else None
+
+    sends: List[Send] = []
+    iteration = state.get("research_iterations", 0)
+
+    def _send(node: str, payload: dict):
+        payload["iteration"] = iteration
+        payload["is_rerun"] = is_rerun
+        sends.append(Send(node, payload))
+
+    for item in plan.items:
+        if wanted_targets is not None and item.target not in wanted_targets:
+            continue
+        item_valid = _valid_dims_for(item)
+        item_dims = (wanted_dims & item_valid) if wanted_dims else item_valid
+        if not item_dims:
+            # Gap dims didn't intersect this item's valid set — fall back to
+            # the item's full valid set so we never emit zero work for it.
+            item_dims = item_valid
+
+        common = {
+            "target": item.target,
+            "query_type": item.query_type,
+        }
+        if "fundamentals" in item_dims:
+            _send("fundamentals_agent", {**common, "questions": item.fundamentals_questions})
+        if "sentiment" in item_dims:
+            _send("sentiment_agent", {**common, "questions": item.sentiment_questions})
+        if "technical" in item_dims:
+            _send("technical_agent", {**common, "questions": item.technical_questions})
+        if "macro" in item_dims:
+            _send("macro_agent", {**common, "questions": item.macro_questions})
 
     return sends
 
 
 # ---- Research agents: receive a Task dict (from Send), return dict-keyed slot update ----
 
+def _rerun_note(task: dict) -> str:
+    if task.get("is_rerun"):
+        return (
+            f"\n\nNOTE: This is research ROUND {task.get('iteration', 1) + 1}. A prior "
+            "round was judged insufficient for this dimension — go DEEPER than usual: "
+            "more tool calls, more query variations, more disconfirming evidence.\n"
+        )
+    return ""
+
+
 def fundamentals_node(task: dict) -> State:
-    ticker = task["ticker"]
+    ticker = task["target"]
     questions = task.get("questions") or [f"General fundamental health of {ticker}"]
-    prompt = (
-        f"You are a fundamentals analyst covering {ticker}.\n"
-        f"Call get_stock_fundamentals and get_earnings_history first, then "
-        f"tavily_web_search for qualitative context (10-K/10-Q commentary, "
-        f"management changes, segment trends). Address each question:\n- "
-        + "\n- ".join(questions)
-        + f"\n\nReturn a finding for ticker '{ticker}': revenue trend, profitability, "
-          "valuation, balance sheet, guidance, key_metrics, summary, confidence (0-1), "
-          "and source URLs."
+    role = (
+        f"You are a senior fundamentals analyst covering {ticker}. Your job is to "
+        "produce a quantitatively specific assessment of revenue trajectory, "
+        "profitability, valuation, balance-sheet health, and forward guidance."
     )
-    finding = _run_subagent(prompt, FUNDAMENTAL_TOOLS, FundamentalsFindings)
+    prompt = (
+        f"Research the fundamentals of {ticker}.\n\n"
+        f"Workflow:\n"
+        f"1. Call get_stock_fundamentals({ticker}) for the latest snapshot — "
+        f"   capture P/E, EV/EBITDA, margins, ROE, debt/equity, FCF, beta.\n"
+        f"2. Call get_earnings_history({ticker}) for the quarterly EPS surprise track.\n"
+        f"3. Call tavily_web_search 2-3 times with DIFFERENT query phrasings — for "
+        f"   example: latest 10-K/10-Q commentary, segment trends, management changes, "
+        f"   competitive position, recent guidance updates. Verify the numbers against "
+        f"   the qualitative narrative.\n\n"
+        f"Address each question:\n- " + "\n- ".join(questions)
+        + f"\n\nReturn a finding for ticker '{ticker}' that includes specific numbers "
+          "(revenue growth %, margins %, multiples, $ values), the most recent guidance, "
+          "and source URLs.\n"
+        + _rerun_note(task)
+    )
+
+    def _fallback(err: str) -> FundamentalsFindings:
+        return FundamentalsFindings(
+            ticker=ticker,
+            revenue_trend="unknown",
+            profitability="unknown",
+            valuation="unknown",
+            balance_sheet="unknown",
+            guidance="unknown",
+            summary=f"Fundamentals research failed: {err}",
+            confidence=0.0,
+            unanswered_questions=list(questions),
+        )
+
+    finding = _run_subagent(
+        role_system=role,
+        task_prompt=prompt,
+        tools=FUNDAMENTAL_TOOLS,
+        schema=FundamentalsFindings,
+        questions=questions,
+        fallback_factory=_fallback,
+    )
     return {"fundamentals": {ticker: finding}}
 
 
 def sentiment_node(task: dict) -> State:
-    ticker = task.get("ticker")
+    target = task["target"]
+    query_type = task["query_type"]
     questions = task.get("questions") or []
-    if ticker:
-        subject = ticker
-        prompt = (
-            f"You are a news & sentiment analyst covering {ticker}.\n"
-            f"Use tavily_news_search and tavily_web_search to address:\n- "
-            + "\n- ".join(questions)
-            + f"\n\nReturn a finding for ticker '{ticker}': headline summary, analyst "
-              "consensus, average price target if available, social sentiment label, "
-              "notable catalysts, summary, confidence (0-1), source URLs."
+
+    if query_type == "stock_analysis":
+        role = (
+            f"You are a news & sentiment analyst covering {target}. Cover headlines, "
+            "analyst consensus, social sentiment, and concrete near-term catalysts."
         )
-        key = ticker
-    else:
-        topic = task.get("topic") or "broad market"
-        subject = topic
         prompt = (
-            f"You are a news & sentiment analyst. The user is asking about: '{topic}'.\n"
-            f"No single ticker is in scope — research the topic broadly using "
-            f"tavily_news_search and tavily_web_search. Address:\n- "
-            + "\n- ".join(questions)
-            + f"\n\nReturn a finding using ticker='{MARKET_KEY}': headline summary, "
-              "analyst consensus on the theme, average price target (null is fine), "
-              "social sentiment, notable catalysts (specific names if discovered), "
-              "summary, confidence (0-1), source URLs."
+            f"Research news & sentiment for {target}.\n\n"
+            f"Workflow:\n"
+            f"1. Call tavily_news_search('{target} stock', days=14) for the most recent "
+            f"   news cycle. Also try 'days=7' for very recent events.\n"
+            f"2. Run a second tavily_news_search with a different angle (earnings, "
+            f"   analyst price target, downgrade/upgrade, regulatory).\n"
+            f"3. Use tavily_web_search to find analyst consensus and any aggregated "
+            f"   price target (e.g. CNN Money, Yahoo Finance analyst page, Zacks).\n"
+            f"4. Probe for DISCONFIRMING news (lawsuits, downgrades, customer losses) "
+            f"   so the assessment isn't one-sided.\n\n"
+            f"Address each question:\n- " + "\n- ".join(questions)
+            + f"\n\nReturn a finding with subject='{target}': headline summary, analyst "
+              "consensus, average price target (if available), social sentiment label, "
+              "specific named catalysts with dates if possible, and source URLs.\n"
+            + _rerun_note(task)
         )
-        key = MARKET_KEY
-    finding = _run_subagent(prompt, SENTIMENT_TOOLS, SentimentFindings)
-    return {"sentiment": {key: finding}}
+    else:  # industry_analysis
+        role = (
+            f"You are a news & sentiment analyst covering the {target} industry. "
+            "Surface specific company names, dates, and concrete catalysts shaping the sector."
+        )
+        prompt = (
+            f"Research news & sentiment for the '{target}' industry.\n\n"
+            f"Workflow:\n"
+            f"1. tavily_news_search('{target} industry', days=14) — capture recent "
+            f"   developments across the sector.\n"
+            f"2. tavily_news_search with a second angle (regulation, earnings cycle, "
+            f"   M&A, leading company catalysts).\n"
+            f"3. tavily_web_search for analyst / industry write-ups; pull names of "
+            f"   specific companies, tickers, and dated events that the research surfaces.\n\n"
+            f"Address each question:\n- " + "\n- ".join(questions)
+            + f"\n\nReturn a finding with subject='{target}'. Populate "
+              "notable_catalysts with SPECIFIC named events / companies / dates from "
+              "the research, not generic phrases. Sources required.\n"
+            + _rerun_note(task)
+        )
+
+    def _fallback(err: str) -> SentimentFindings:
+        return SentimentFindings(
+            subject=target,
+            headline_summary=f"Sentiment research failed: {err}",
+            analyst_consensus="unknown",
+            social_sentiment="neutral",
+            summary=f"Sentiment research failed: {err}",
+            confidence=0.0,
+            unanswered_questions=list(questions),
+        )
+
+    finding = _run_subagent(
+        role_system=role,
+        task_prompt=prompt,
+        tools=SENTIMENT_TOOLS,
+        schema=SentimentFindings,
+        questions=questions,
+        fallback_factory=_fallback,
+    )
+    return {"sentiment": {target: finding}}
 
 
 def technical_node(task: dict) -> State:
-    ticker = task["ticker"]
+    ticker = task["target"]
     questions = task.get("questions") or [f"Trend, momentum, and key levels for {ticker}"]
-    prompt = (
-        f"You are a technical analyst covering {ticker}.\n"
-        f"Call get_price_history (period='6mo') and get_stock_quote. Address:\n- "
-        + "\n- ".join(questions)
-        + f"\n\nReturn a finding for ticker '{ticker}': current price, trend, moving "
-          "averages commentary, RSI, volume profile, support/resistance, momentum "
-          "signal, summary, confidence (0-1)."
+    role = (
+        f"You are a technical analyst covering {ticker}. Be precise with numbers — "
+        "RSI, SMA values, price vs MA, support / resistance levels in $."
     )
-    finding = _run_subagent(prompt, TECHNICAL_TOOLS, TechnicalFindings)
+    prompt = (
+        f"Run a technical read on {ticker}.\n\n"
+        f"Workflow:\n"
+        f"1. Call get_price_history({ticker}, period='6mo') — capture last close, "
+        f"   SMA20/50/200, RSI14, period high/low, volume averages.\n"
+        f"2. Call get_price_history({ticker}, period='1y') for a longer-term trend read.\n"
+        f"3. Call get_stock_quote({ticker}) to confirm current price vs the historical close.\n"
+        f"4. From the numbers, identify support and resistance levels (recent swing lows/highs, "
+        f"   round numbers near the price, the 50/200 SMA).\n\n"
+        f"Address each question:\n- " + "\n- ".join(questions)
+        + f"\n\nReturn a finding for ticker '{ticker}' with: current_price (numeric), "
+          "trend label, moving_averages commentary citing specific SMA values, RSI14 "
+          "(numeric), volume_profile vs the 30d average, explicit support/resistance "
+          "levels in $, and a momentum_signal label.\n"
+        + _rerun_note(task)
+    )
+
+    def _fallback(err: str) -> TechnicalFindings:
+        return TechnicalFindings(
+            ticker=ticker,
+            trend="sideways",
+            moving_averages="unknown",
+            volume_profile="unknown",
+            support_resistance="unknown",
+            momentum_signal="neutral",
+            summary=f"Technical research failed: {err}",
+            confidence=0.0,
+            unanswered_questions=list(questions),
+        )
+
+    finding = _run_subagent(
+        role_system=role,
+        task_prompt=prompt,
+        tools=TECHNICAL_TOOLS,
+        schema=TechnicalFindings,
+        questions=questions,
+        fallback_factory=_fallback,
+    )
     return {"technical": {ticker: finding}}
 
 
 def macro_node(task: dict) -> State:
-    ticker = task.get("ticker")
+    target = task["target"]
+    query_type = task["query_type"]
     questions = task.get("questions") or []
-    if ticker:
-        prompt = (
-            f"You are a macro & sector analyst covering {ticker}.\n"
-            f"Use get_peer_comparison and tavily_web_search to address:\n- "
-            + "\n- ".join(questions)
-            + f"\n\nReturn a finding for ticker '{ticker}': sector, industry trends, "
-              "competitor comparison, macro drivers, summary, confidence (0-1), source URLs."
+
+    if query_type == "stock_analysis":
+        role = (
+            f"You are a macro & sector analyst covering {target}. Place the company "
+            "within its sector and surface the cyclical / structural drivers that "
+            "matter for forward returns."
         )
-        key = ticker
-    else:
-        topic = task.get("topic") or "broad market"
         prompt = (
-            f"You are a macro & sector analyst. The user is asking about: '{topic}'.\n"
-            f"Research the topic broadly using tavily_web_search. Address:\n- "
-            + "\n- ".join(questions)
-            + f"\n\nReturn a finding using ticker='{MARKET_KEY}': the most relevant "
-              "sector, industry trends, competitor / peer landscape, macro drivers, "
-              "summary, confidence (0-1), source URLs."
+            f"Research the macro & sector context for {target}.\n\n"
+            f"Workflow:\n"
+            f"1. Call get_peer_comparison({target}) — capture named peers and any "
+            f"   relative-value commentary.\n"
+            f"2. tavily_web_search for the sector outlook (e.g. '{target} sector "
+            f"   outlook 2025', industry growth drivers, regulatory headwinds).\n"
+            f"3. tavily_web_search for macro drivers relevant to this sector (rates, "
+            f"   FX, commodity, regulation, demand cycle).\n\n"
+            f"Address each question:\n- " + "\n- ".join(questions)
+            + f"\n\nReturn a finding with subject='{target}': sector, industry_trends "
+              "with specific named drivers, competitor_comparison naming 2+ peers, "
+              "macro_drivers, source URLs.\n"
+            + _rerun_note(task)
         )
-        key = MARKET_KEY
-    finding = _run_subagent(prompt, MACRO_TOOLS, MacroFindings)
-    return {"macro": {key: finding}}
+    else:  # industry_analysis
+        role = (
+            f"You are a macro & sector analyst covering the {target} industry. "
+            "Identify the structural drivers, leading companies, and macro context."
+        )
+        prompt = (
+            f"Research the macro & sector context for the '{target}' industry.\n\n"
+            f"Workflow:\n"
+            f"1. tavily_web_search('{target} sector outlook') — capture the most "
+            f"   relevant structural drivers and growth/headwind narrative.\n"
+            f"2. tavily_web_search for the competitive landscape — name specific "
+            f"   companies / tickers that lead this industry.\n"
+            f"3. tavily_web_search for the macro context (rates, regulation, "
+            f"   supply / demand, geopolitical).\n\n"
+            f"Address each question:\n- " + "\n- ".join(questions)
+            + f"\n\nReturn a finding with subject='{target}': sector, industry trends "
+              "with named drivers, competitor_comparison naming 2+ leading companies, "
+              "macro drivers, source URLs.\n"
+            + _rerun_note(task)
+        )
+
+    def _fallback(err: str) -> MacroFindings:
+        return MacroFindings(
+            subject=target,
+            sector="unknown",
+            industry_trends="unknown",
+            competitor_comparison="unknown",
+            macro_drivers="unknown",
+            summary=f"Macro research failed: {err}",
+            confidence=0.0,
+            unanswered_questions=list(questions),
+        )
+
+    finding = _run_subagent(
+        role_system=role,
+        task_prompt=prompt,
+        tools=MACRO_TOOLS,
+        schema=MacroFindings,
+        questions=questions,
+        fallback_factory=_fallback,
+    )
+    return {"macro": {target: finding}}
 
 
 def aggregator_node(state: State) -> State:
@@ -340,7 +665,7 @@ def aggregator_node(state: State) -> State:
     return {"research_iterations": state.get("research_iterations", 0) + 1}
 
 
-# ---- Helpers to assemble multi-ticker payloads ----
+# ---- Helpers to assemble multi-item payloads ----
 
 def _findings_block(label: str, findings: Dict[str, Any]) -> str:
     if not findings:
@@ -360,65 +685,118 @@ def _all_findings_payload(state: State) -> str:
     )
 
 
+def _plan_summary(plan: ResearchPlan) -> str:
+    """Compact textual summary of the plan items for LLM context."""
+    lines = ["PLAN ITEMS:"]
+    for item in plan.items:
+        lines.append(f"  - [{item.query_type}] {item.target}")
+    return "\n".join(lines) + "\n"
+
+
 def critic_node(state: State) -> State:
-    """Investment-committee chair: is the evidence decision-ready?"""
+    """Investment-committee chair: is the evidence decision-ready?
+
+    Concrete tests the critic applies:
+      - Every plan question answered (no entries in `unanswered_questions`).
+      - Confidence per applicable (target, dimension) is >= MIN_DIMENSION_CONFIDENCE.
+      - Sources are present for sentiment / fundamentals / macro findings.
+      - No internal contradictions between dimensions.
+
+    When sufficient=False, populate `gap_dimensions` and `gap_targets` precisely
+    so the dispatcher only re-runs what's actually missing.
+    """
     plan: ResearchPlan = state["research_plan"]
     system = (
-        "You are a skeptical investment-committee chair. Evaluate the research findings "
-        "(possibly across multiple tickers) for completeness, internal consistency, and "
-        "decision-readiness. Mark sufficient=false if any dimension for any ticker has "
-        "confidence < 0.6, unanswered plan questions, missing data, or contradictions. "
-        "List specific gaps when not sufficient (cite ticker + dimension)."
+        "You are a skeptical investment-committee chair. Decide if the assembled "
+        "research is decision-ready.\n\n"
+        "Recall: stock_analysis items should have findings across all 4 dimensions; "
+        "industry_analysis items should have findings only for sentiment + macro.\n\n"
+        "Mark sufficient=false if ANY of these are true:\n"
+        f"  - Any applicable (target, dimension) finding has confidence < {MIN_DIMENSION_CONFIDENCE}.\n"
+        "  - Any finding has non-empty `unanswered_questions`.\n"
+        "  - Fundamentals / sentiment / macro findings are missing source URLs.\n"
+        "  - Findings contradict each other (e.g. sentiment bullish but technical screams "
+        "    breakdown without explanation).\n"
+        "  - Numbers are absent where they were required (vague qualifiers only).\n\n"
+        "When sufficient=false:\n"
+        "  - `gaps` must be specific: cite target + dimension + what's missing.\n"
+        "  - `gap_dimensions` must list ONLY the dimensions that need rework "
+        "    (any subset of: fundamentals, sentiment, technical, macro).\n"
+        "  - `gap_targets` must list ONLY the targets that need rework (empty = all).\n"
+        "  - Be surgical — listing every dimension wastes a research round.\n"
     )
     payload = (
         f"USER QUERY: {state['user_query']}\n"
-        f"QUERY TYPE: {plan.query_type}\n"
-        f"TICKERS: {plan.tickers or '(none — general query)'}\n\n"
+        f"RESEARCH ROUND: {state.get('research_iterations', 0)}\n\n"
+        + _plan_summary(plan)
+        + "\n"
         + _all_findings_payload(state)
     )
-    judge = _llm(temperature=0).with_structured_output(CriticDecision)
+    judge = _llm(model=REASONING_MODEL, temperature=0).with_structured_output(CriticDecision)
     return {"critic": judge.invoke([SystemMessage(content=system), HumanMessage(content=payload)])}
 
 
-def risk_node(state: State) -> State:
-    plan: ResearchPlan = state["research_plan"]
-    system = (
-        "You are a risk officer. Build a risk assessment from the assembled research. "
-        "Cover volatility, drawdown, financial leverage, business concentration, and "
-        "macro risk. For multi-ticker analyses, also populate per_ticker_risks with one "
-        "entry per ticker. Give an overall risk rating that reflects the full set."
-    )
-    payload = (
-        f"QUERY TYPE: {plan.query_type}\nTICKERS: {plan.tickers}\n\n"
-        + _all_findings_payload(state)
-    )
-    risk_llm = _llm(temperature=0.1).with_structured_output(RiskAssessment)
-    return {"risk": risk_llm.invoke([SystemMessage(content=system), HumanMessage(content=payload)])}
-
-
 def synthesis_node(state: State) -> State:
-    """Portfolio-manager voice: integrate research + risk into a thesis."""
+    """Portfolio-manager voice: integrate the research into per-item outlooks
+    (each carrying its own future outlook, risk view, and recommendation)."""
     plan: ResearchPlan = state["research_plan"]
-    is_general = plan.query_type == "general"
+    has_stocks = plan.has_stock_items()
+    has_industries = plan.has_industry_items()
+
+    type_guidance_parts: List[str] = []
+    if has_stocks:
+        type_guidance_parts.append(
+            "STOCK_OUTLOOKS — produce ONE entry per stock_analysis target. For each stock:\n"
+            "  - future_outlook: where the stock is headed and why, grounded in the findings.\n"
+            "  - bull_case: 2-4 specific bullish points (numbers, catalysts, analyst datapoints).\n"
+            "  - bear_case: 2-4 specific bearish points (disconfirming evidence from findings).\n"
+            "  - risk_rating: low / moderate / high / very_high.\n"
+            "  - risk_assessment: volatility (RSI, % off highs, beta), drawdown exposure, "
+            "    leverage (debt/equity, totalDebt), business concentration, idiosyncratic risks.\n"
+            "  - recommendation: Strong Buy / Buy / Hold / Sell / Strong Sell — must follow the "
+            "    weight of bull vs bear evidence, not be retrofitted to it.\n"
+            "  - conviction + rationale (1-2 sentences)."
+        )
+    if has_industries:
+        type_guidance_parts.append(
+            "INDUSTRY_OUTLOOKS — produce ONE entry per industry_analysis target. For each industry:\n"
+            "  - future_outlook: the sector trajectory, drivers, and headwinds — specific named "
+            "    catalysts and players where available.\n"
+            "  - risk_rating: low / moderate / high / very_high.\n"
+            "  - risk_assessment: macro drivers (rates, FX, demand cycle), regulatory exposure, "
+            "    cyclicality, competitive intensity.\n"
+            "  - recommendation: Overweight / Neutral / Underweight — sector positioning call.\n"
+            "  - conviction + rationale (1-2 sentences)."
+        )
+    if has_stocks and has_industries:
+        type_guidance_parts.append(
+            "MIXED plan — thesis_summary must connect the dots: explain how the industry "
+            "backdrop shapes each stock recommendation."
+        )
+    if not has_stocks:
+        type_guidance_parts.append(
+            "INDUSTRY-ONLY plan — leave stock_outlooks EMPTY. thesis_summary should directly "
+            "answer the user's question using the industry findings."
+        )
+    if not has_industries:
+        type_guidance_parts.append(
+            "STOCK-ONLY plan — leave industry_outlooks EMPTY."
+        )
+
     system = (
-        "You are a portfolio manager writing an investment thesis. Integrate the research "
-        "and risk assessment into a structured InvestmentThesis.\n\n"
-        "Rules:\n"
-        "- For single_ticker queries: produce a clear primary_recommendation and one "
-        "  per_ticker_recommendations entry. Populate bull_case, bear_case, key_risks, "
-        "  and catalysts.\n"
-        "- For portfolio queries: produce per_ticker_recommendations for EVERY ticker. "
-        "  primary_recommendation summarises the portfolio (use 'Mixed' if recs diverge). "
-        "  Populate bull_case, bear_case, key_risks, and catalysts.\n"
-        "- For general (ticker-less) queries: this is an informational question, NOT an "
-        "  investment recommendation. Set primary_recommendation='N/A', leave "
-        "  per_ticker_recommendations empty (unless specific tickers were surfaced worth "
-        "  flagging), and leave bull_case AND bear_case as EMPTY lists. Use thesis_summary "
-        "  to directly answer the user's question using the research findings. Populate "
-        "  key_risks and catalysts only if genuinely relevant to the topic; otherwise "
-        "  leave them empty.\n"
-        "- Be specific, avoid hedge-everywhere prose."
+        "You are a portfolio manager writing an investment thesis. Integrate the "
+        "research into a structured InvestmentThesis with per-item outlooks.\n\n"
+        "Discipline:\n"
+        "  - Every bull / bear case point and every risk claim must be backed by a "
+        "    SPECIFIC fact from the findings (a number, a named catalyst, an analyst "
+        "    datapoint). No generic 'strong fundamentals' filler.\n"
+        "  - Recommendations must follow the evidence, not the other way around. If "
+        "    the bear case outweighs the bull case, the recommendation reflects that.\n"
+        "  - Acknowledge contradictions explicitly — don't paper over them.\n"
+        "  - overall_conviction reflects the FULL set of items, not the single loudest one.\n\n"
+        + "\n\n".join(type_guidance_parts)
     )
+
     revision_note = ""
     if state.get("human_review") and state["human_review"].decision == "revise":
         revision_note = (
@@ -434,33 +812,31 @@ def synthesis_node(state: State) -> State:
 
     payload = (
         f"USER QUERY: {state['user_query']}\n"
-        f"QUERY TYPE: {plan.query_type}\nTICKERS: {plan.tickers}{holdings_str}\n\n"
+        + _plan_summary(plan)
+        + holdings_str + "\n\n"
         + _all_findings_payload(state)
-        + f"\nRISK:\n{state['risk'].model_dump_json(indent=2)}{revision_note}"
+        + revision_note
     )
-    pm = _llm(model="gpt-4o", temperature=0.2).with_structured_output(InvestmentThesis)
+    pm = _llm(model=REASONING_MODEL, temperature=0.2).with_structured_output(InvestmentThesis)
     return {"thesis": pm.invoke([SystemMessage(content=system), HumanMessage(content=payload)])}
 
 
 def human_review_node(state: State) -> State:
     """Pause the graph for investor approval (LangGraph interrupt)."""
     thesis: InvestmentThesis = state["thesis"]
-    risk: RiskAssessment = state["risk"]
     plan: ResearchPlan = state["research_plan"]
+    is_informational = not plan.has_stock_items()
     payload = {
-        "query_type": plan.query_type,
-        "tickers": plan.tickers,
-        "primary_recommendation": thesis.primary_recommendation,
-        "overall_conviction": thesis.overall_conviction,
-        "per_ticker_recommendations": [
-            r.model_dump() for r in thesis.per_ticker_recommendations
+        "items": [
+            {"query_type": i.query_type, "target": i.target} for i in plan.items
         ],
+        "stock_targets": plan.stock_targets(),
+        "industry_targets": plan.industry_targets(),
+        "overall_conviction": thesis.overall_conviction,
+        "stock_outlooks": [o.model_dump() for o in thesis.stock_outlooks],
+        "industry_outlooks": [o.model_dump() for o in thesis.industry_outlooks],
         "thesis_summary": thesis.thesis_summary,
-        "bull_case": thesis.bull_case,
-        "bear_case": thesis.bear_case,
-        "key_risks": thesis.key_risks,
-        "overall_risk_rating": risk.overall_risk_rating,
-        "is_general": plan.query_type == "general",
+        "is_informational": is_informational,
         "instruction": (
             "Resume with {'decision': 'approve'} to finalise, or "
             "{'decision': 'revise', 'feedback': '<what to change>'} to iterate."
@@ -477,32 +853,65 @@ def human_review_node(state: State) -> State:
 
 def final_report_node(state: State) -> State:
     plan: ResearchPlan = state["research_plan"]
-    if plan.query_type == "general":
-        system = (
-            "You are a senior research editor. The user asked an informational question, "
-            "NOT for an investment recommendation. Produce a polished markdown report that "
-            "DIRECTLY answers the question using the research findings.\n\n"
-            "Do NOT include bull case, bear case, buy/sell recommendations, or per-ticker "
-            "calls unless the research specifically surfaced names worth flagging.\n\n"
-            "Sections: headline, executive summary (the answer), supporting details with "
-            "specific names / dates / sources from the research, and (only if relevant) a "
-            "brief note on risks or caveats. Set primary_recommendation to 'N/A'."
+    has_stocks = plan.has_stock_items()
+    has_industries = plan.has_industry_items()
+
+    sections: List[str] = ["  1. Headline", "  2. Executive summary"]
+    next_no = 3
+    if has_industries:
+        sections.append(
+            f"  {next_no}. Industry breakdown — ONE subsection per industry, each containing: "
+            "future outlook, risk assessment, recommendation (Overweight/Neutral/Underweight). "
+            "Cite specific drivers, named companies, and sources."
+        )
+        next_no += 1
+    if has_stocks:
+        sections.append(
+            f"  {next_no}. Per-stock breakdown — ONE subsection per ticker, each containing: "
+            "future outlook, bull case, bear case, risk assessment, recommendation "
+            "(Strong Buy/Buy/Hold/Sell/Strong Sell). Cite specific numbers and sources."
+        )
+        next_no += 1
+    sections.append(
+        f"  {next_no}. Evidence by dimension (Fundamentals, Sentiment, Technical, Macro)"
+    )
+
+    if has_stocks and has_industries:
+        mix_note = (
+            "MIXED plan — connect the two: explain how each industry's outlook shapes the "
+            "stock recommendations that sit inside it.\n\n"
+        )
+    elif has_industries and not has_stocks:
+        mix_note = (
+            "INDUSTRY-ONLY plan — the report is informational, not a per-stock recommendation. "
+            "Set primary_recommendation to a brief sector summary (e.g. 'Overweight Technology, "
+            "Neutral Healthcare').\n\n"
         )
     else:
-        system = (
-            "You are a senior equity-research editor. Produce a polished, investor-ready "
-            "markdown report. Sections: headline, executive summary, detailed thesis, "
-            "per-ticker breakdown (one subsection per ticker if multiple), evidence by "
-            "dimension, risk disclosures, and the final recommendation(s). Be specific."
-        )
+        mix_note = ""
+
+    system = (
+        "You are a senior equity-research editor. Produce a polished, investor-ready "
+        "markdown report from the InvestmentThesis and research findings.\n\n"
+        f"{mix_note}"
+        "Sections (in order):\n"
+        + "\n".join(sections) + "\n\n"
+        "Discipline: cite specific numbers and named sources from the research. "
+        "No filler. Use markdown tables where they aid comparison.\n\n"
+        "Populate tickers_covered with the stock_outlook tickers and "
+        "industries_covered with the industry_outlook labels. primary_recommendation "
+        "should be a concise headline phrase summarising the calls."
+    )
+
     payload = (
-        f"USER QUERY: {state['user_query']}\nQUERY TYPE: {plan.query_type}\n"
-        f"TICKERS: {plan.tickers}\n\n"
+        f"USER QUERY: {state['user_query']}\n"
+        + _plan_summary(plan)
+        + f"\nSTOCK TARGETS:    {plan.stock_targets()}\n"
+        + f"INDUSTRY TARGETS: {plan.industry_targets()}\n\n"
         f"THESIS:\n{state['thesis'].model_dump_json(indent=2)}\n\n"
-        f"RISK:\n{state['risk'].model_dump_json(indent=2)}\n\n"
         + _all_findings_payload(state)
     )
-    editor = _llm(model="gpt-4o", temperature=0.2).with_structured_output(FinalReport)
+    editor = _llm(model=REASONING_MODEL, temperature=0.2).with_structured_output(FinalReport)
     report = editor.invoke([SystemMessage(content=system), HumanMessage(content=payload)])
     return {
         "final_report": report,
@@ -545,7 +954,6 @@ def build_graph():
     graph.add_node("macro_agent", macro_node)
     graph.add_node("aggregator", aggregator_node)
     graph.add_node("critic", critic_node)
-    graph.add_node("risk", risk_node)
     graph.add_node("synthesis", synthesis_node)
     graph.add_node("human_review", human_review_node)
     graph.add_node("final_report", final_report_node)
@@ -553,7 +961,7 @@ def build_graph():
     graph.add_edge(START, "user_query")
     graph.add_edge("user_query", "query_planner")
 
-    # Dynamic fan-out via Send (per-ticker × per-dimension, or topic-only for general)
+    # Dynamic fan-out via Send (per-item × per-dimension).
     graph.add_conditional_edges("query_planner", dispatch_research, RESEARCH_NODES)
     for node in RESEARCH_NODES:
         graph.add_edge(node, "aggregator")
@@ -562,10 +970,9 @@ def build_graph():
     graph.add_conditional_edges(
         "critic",
         critic_router,
-        {"sufficient": "risk", "gather_more": "query_planner"},
+        {"sufficient": "synthesis", "gather_more": "query_planner"},
     )
 
-    graph.add_edge("risk", "synthesis")
     graph.add_edge("synthesis", "human_review")
     graph.add_conditional_edges(
         "human_review",
@@ -578,6 +985,7 @@ def build_graph():
     # to silence "unregistered type" warnings and stay forward-compatible.
     serde = JsonPlusSerializer(allowed_msgpack_modules=[
         ResearchPlan,
+        QueryItem,
         Holding,
         FundamentalsFindings,
         KeyMetric,
@@ -585,10 +993,9 @@ def build_graph():
         TechnicalFindings,
         MacroFindings,
         CriticDecision,
-        RiskAssessment,
-        TickerRisk,
         InvestmentThesis,
-        TickerRecommendation,
+        StockOutlook,
+        IndustryOutlook,
         HumanReview,
         FinalReport,
     ])
@@ -598,327 +1005,8 @@ def build_graph():
 app = build_graph()
 
 
-# ---------- Pretty terminal rendering (rich) ----------
-
-console = Console()
-
-NODE_STYLE = {
-    "query_planner":      ("Query Planner",                "blue"),
-    "fundamentals_agent": ("Fundamentals Agent",           "yellow"),
-    "sentiment_agent":    ("News & Sentiment Agent",       "magenta"),
-    "technical_agent":    ("Technical Analysis Agent",     "green"),
-    "macro_agent":        ("Macro & Sector Agent",         "cyan"),
-    "aggregator":         ("Aggregator",                   "cyan"),
-    "critic":             ("Critic",                       "yellow"),
-    "risk":               ("Risk Assessment",              "red"),
-    "synthesis":          ("Synthesis & Thesis",           "magenta"),
-    "final_report":       ("Final Report",                 "green"),
-}
-
-
-def _format_payload(node: str, payload: dict):
-    if node == "query_planner":
-        plan: Optional[ResearchPlan] = payload.get("research_plan")
-        if not plan:
-            return None
-        t = Table(show_header=False, box=None, padding=(0, 1))
-        t.add_column(style="bold")
-        t.add_column()
-        t.add_row("Query type", plan.query_type)
-        t.add_row("Tickers", ", ".join(plan.tickers) if plan.tickers else "(none — general query)")
-        if plan.holdings:
-            t.add_row("Holdings", ", ".join(f"{h.quantity:g} {h.ticker}" for h in plan.holdings))
-        if plan.topic:
-            t.add_row("Topic", plan.topic)
-        t.add_row("Horizon", plan.investor_horizon)
-        t.add_row("Questions",
-                  f"fund ({len(plan.fundamentals_questions)})  "
-                  f"sent ({len(plan.sentiment_questions)})  "
-                  f"tech ({len(plan.technical_questions)})  "
-                  f"macro ({len(plan.macro_questions)})")
-        return t
-
-    if node == "fundamentals_agent":
-        d = payload.get("fundamentals") or {}
-        if not d:
-            return None
-        ticker, f = next(iter(d.items()))
-        return (f"[bold]Ticker:[/] {ticker}\n"
-                f"[bold]Summary:[/] {f.summary}\n"
-                f"[bold]Valuation:[/] {f.valuation}\n"
-                f"[bold]Confidence:[/] {f.confidence:.2f}")
-
-    if node == "sentiment_agent":
-        d = payload.get("sentiment") or {}
-        if not d:
-            return None
-        key, s = next(iter(d.items()))
-        return (f"[bold]Subject:[/] {key}\n"
-                f"[bold]Social sentiment:[/] {s.social_sentiment}\n"
-                f"[bold]Analyst consensus:[/] {s.analyst_consensus}\n"
-                f"[bold]Headlines:[/] {s.headline_summary}\n"
-                f"[bold]Confidence:[/] {s.confidence:.2f}")
-
-    if node == "technical_agent":
-        d = payload.get("technical") or {}
-        if not d:
-            return None
-        ticker, t = next(iter(d.items()))
-        price = f"${t.current_price:.2f}" if t.current_price else "n/a"
-        rsi = f"{t.rsi:.1f}" if t.rsi else "n/a"
-        return (f"[bold]Ticker:[/] {ticker}\n"
-                f"[bold]Trend:[/] {t.trend}   [bold]Momentum:[/] {t.momentum_signal}\n"
-                f"[bold]Price:[/] {price}   [bold]RSI14:[/] {rsi}\n"
-                f"[bold]Summary:[/] {t.summary}\n"
-                f"[bold]Confidence:[/] {t.confidence:.2f}")
-
-    if node == "macro_agent":
-        d = payload.get("macro") or {}
-        if not d:
-            return None
-        key, m = next(iter(d.items()))
-        return (f"[bold]Subject:[/] {key}\n"
-                f"[bold]Sector:[/] {m.sector}\n"
-                f"[bold]Industry:[/] {m.industry_trends}\n"
-                f"[bold]Summary:[/] {m.summary}\n"
-                f"[bold]Confidence:[/] {m.confidence:.2f}")
-
-    if node == "aggregator":
-        return f"Research round [bold]{payload.get('research_iterations')}[/] complete."
-
-    if node == "critic":
-        c = payload.get("critic")
-        if not c:
-            return None
-        verdict = "[bold green]SUFFICIENT[/]" if c.sufficient else "[bold yellow]NEEDS MORE[/]"
-        body = f"[bold]Verdict:[/] {verdict}\n[bold]Rationale:[/] {c.rationale}"
-        if c.gaps:
-            body += "\n[bold]Gaps:[/]\n  - " + "\n  - ".join(c.gaps)
-        return body
-
-    if node == "risk":
-        r = payload.get("risk")
-        if not r:
-            return None
-        body = (f"[bold]Overall risk:[/] [bold red]{r.overall_risk_rating}[/]\n"
-                f"[bold]Summary:[/] {r.summary}")
-        if r.per_ticker_risks:
-            body += "\n[bold]Per ticker:[/]\n" + "\n".join(
-                f"  - {pr.ticker}: [red]{pr.risk_rating}[/]"
-                for pr in r.per_ticker_risks
-            )
-        return body
-
-    if node == "synthesis":
-        th = payload.get("thesis")
-        if not th:
-            return None
-        is_general = th.primary_recommendation == "N/A"
-        if is_general:
-            body = f"[bold]Answer:[/] {th.thesis_summary}"
-        else:
-            body = (f"[bold]Recommendation:[/] [bold]{th.primary_recommendation}[/]   "
-                    f"[bold]Conviction:[/] {th.overall_conviction}\n"
-                    f"[bold]Thesis:[/] {th.thesis_summary}")
-        if th.per_ticker_recommendations:
-            body += "\n[bold]Per ticker:[/]\n" + "\n".join(
-                f"  - {r.ticker}: [bold]{r.recommendation}[/] ({r.conviction}) — {r.rationale}"
-                for r in th.per_ticker_recommendations
-            )
-        return body
-
-    if node == "final_report":
-        fr = payload.get("final_report")
-        if not fr:
-            return None
-        return f"[bold]Headline:[/] {fr.headline}\n[dim]Full report rendered below.[/]"
-
-    return None
-
-
-def render_node_update(node: str, payload):
-    if node == "__interrupt__" or node == "user_query":
-        return
-    if not isinstance(payload, dict):
-        return
-    spec = NODE_STYLE.get(node)
-    if not spec:
-        return
-    title, color = spec
-    body = _format_payload(node, payload)
-    if body is None:
-        return
-    # For per-ticker agents, append the ticker to the panel title.
-    suffix = ""
-    for slot in ("fundamentals", "sentiment", "technical", "macro"):
-        d = payload.get(slot)
-        if d:
-            keys = list(d.keys())
-            if len(keys) == 1:
-                suffix = f"  -  {keys[0]}"
-            break
-    console.print(Panel(body, title=f"[bold {color}]{title}[/]{suffix}",
-                        border_style=color, expand=True))
-
-
-def prompt_human(payload: dict) -> dict:
-    """Interactive human-in-the-loop review prompt."""
-    console.print(Rule(title="[bold yellow]Investor Review Required[/]", style="yellow"))
-
-    summary = Table(show_header=False, box=None, padding=(0, 1))
-    summary.add_column(style="bold")
-    summary.add_column()
-    summary.add_row("Query type", str(payload.get("query_type")))
-    tickers = payload.get("tickers") or []
-    summary.add_row("Tickers", ", ".join(tickers) if tickers else "(general query)")
-    summary.add_row("Recommendation", f"[bold]{payload.get('primary_recommendation')}[/]")
-    summary.add_row("Conviction", str(payload.get("overall_conviction")))
-    summary.add_row("Risk rating", str(payload.get("overall_risk_rating")))
-    console.print(Panel(summary, border_style="yellow"))
-
-    per_ticker = payload.get("per_ticker_recommendations") or []
-    if per_ticker:
-        tbl = Table(title="Per-ticker recommendations", title_style="bold yellow")
-        tbl.add_column("Ticker", style="bold")
-        tbl.add_column("Recommendation", style="bold")
-        tbl.add_column("Conviction")
-        tbl.add_column("Rationale", overflow="fold")
-        for r in per_ticker:
-            tbl.add_row(str(r.get("ticker")), str(r.get("recommendation")),
-                        str(r.get("conviction")), str(r.get("rationale")))
-        console.print(tbl)
-
-    console.print(f"\n[bold]Answer:[/] {payload.get('thesis_summary')}\n"
-                  if payload.get("is_general")
-                  else f"\n[bold]Thesis:[/] {payload.get('thesis_summary')}\n")
-
-    def _bullets(items, style):
-        if not items:
-            return f"[{style}]  (none)[/]"
-        return "\n".join(f"[{style}]  - {it}[/]" for it in items)
-
-    # Skip bull/bear case sections for general informational queries.
-    if not payload.get("is_general"):
-        console.print("[bold green]Bull case[/]")
-        console.print(_bullets(payload.get("bull_case", []), "green"))
-        console.print("\n[bold red]Bear case[/]")
-        console.print(_bullets(payload.get("bear_case", []), "red"))
-
-    if payload.get("key_risks"):
-        console.print("\n[bold yellow]Key risks[/]")
-        console.print(_bullets(payload.get("key_risks", []), "yellow"))
-    console.print()
-
-    decision = Prompt.ask(
-        "[bold]Approve the thesis or request a revision?[/]",
-        choices=["approve", "revise"],
-        default="approve",
-    )
-    if decision == "revise":
-        feedback = Prompt.ask("[yellow]What would you like changed?[/]")
-        return {"decision": "revise", "feedback": feedback}
-    return {"decision": "approve"}
-
-
-# ---------- Interactive runner ----------
-
-def run_research(query: str, config: dict) -> None:
-    """Stream the graph for one user query, handling interrupts interactively."""
-    inputs = {
-        "user_query": query,
-        "research_iterations": 0,
-        "revision_iterations": 0,
-        "fundamentals": {},
-        "sentiment": {},
-        "technical": {},
-        "macro": {},
-    }
-
-    # Text shown on the spinner WHILE the next step is being generated.
-    # Indexed by the node that just completed (so we describe what's coming).
-    next_step_message = {
-        "user_query":         "Planning research...",
-        "query_planner":      "Dispatching research agents...",
-        "fundamentals_agent": "Gathering research findings...",
-        "sentiment_agent":    "Gathering research findings...",
-        "technical_agent":    "Gathering research findings...",
-        "macro_agent":        "Gathering research findings...",
-        "aggregator":         "Critiquing evidence...",
-        "critic":             "Assessing risk...",
-        "risk":               "Synthesising thesis...",
-        "synthesis":          "Awaiting investor review...",
-        "human_review":       "Generating final report...",
-        "final_report":       "Wrapping up...",
-    }
-
-    resume_value = None
-    first = True
-
-    while True:
-        if first:
-            stream_input = inputs
-            current_status = "Planning research..."
-            first = False
-        else:
-            stream_input = Command(resume=resume_value)
-            current_status = (
-                "Revising thesis..."
-                if resume_value.get("decision") == "revise"
-                else "Generating final report..."
-            )
-
-        with console.status(f"[dim]{current_status}[/]", spinner="dots") as status:
-            for event in app.stream(stream_input, config=config, stream_mode="updates"):
-                for node, payload in event.items():
-                    render_node_update(node, payload)
-                    msg = next_step_message.get(node)
-                    if msg:
-                        status.update(f"[dim]{msg}[/]")
-
-        snapshot = app.get_state(config)
-        pending = [t for t in snapshot.tasks if t.interrupts]
-        if not pending:
-            break
-        resume_value = prompt_human(pending[0].interrupts[0].value)
-
-    final = app.get_state(config).values.get("final_report")
-    if final:
-        console.print(Rule(title="[bold green]Final Recommendation Report[/]", style="green"))
-        console.print(Markdown(final.full_markdown))
-        console.print(Rule(style="green"))
-
-
-def main() -> None:
-    console.print(Rule(title="[bold blue]Deep Research Stock Picker[/]", style="blue"))
-    console.print(
-        "[dim]Ask any investment question. Examples:\n"
-        "  - 'Is TSLA a buy for the next year?' (single ticker)\n"
-        "  - 'Analyse my positions: 3 VOO, 4 GOOGL, 7 NVDA, 2 JPM' (portfolio)\n"
-        "  - 'What stocks are going to IPO this year?' (general — no ticker)\n"
-        "Type 'exit' to quit.[/]\n"
-    )
-
-    session = 0
-    while True:
-        session += 1
-        try:
-            query = Prompt.ask("[bold cyan]Question[/]").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]Goodbye.[/]")
-            return
-        if not query:
-            continue
-        if query.lower() in ("exit", "quit", "q"):
-            console.print("[dim]Goodbye.[/]")
-            return
-
-        config = {"configurable": {"thread_id": f"session-{session}"}}
-        try:
-            run_research(query, config)
-        except Exception:
-            console.print_exception()
-        console.print()
-
-
 if __name__ == "__main__":
-    main()
+    # The interactive CLI lives in cli.py — delegate to it so `python agent.py`
+    # still works for users who used to launch it that way.
+    from cli import main as _cli_main
+    _cli_main()
