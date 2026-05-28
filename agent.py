@@ -1,4 +1,4 @@
-r"""Deep-research stock-picking agent built on LangGraph.
+"""Deep-research stock-picking agent built on LangGraph.
 
 Graph (multi-item dispatch):
 
