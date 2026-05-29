@@ -79,6 +79,11 @@ from tools import (
 
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError(
+        "OPENAI_API_KEY is not set. Locally, add it to .env. "
+        "On Streamlit Cloud, add it under App settings -> Secrets."
+    )
 
 # ---------- Tunables ----------
 
@@ -97,15 +102,10 @@ EXTRACTOR_MODEL = "gpt-4o-mini"
 # treat a finding as insufficient. Mirrored in the critic prompt.
 MIN_DIMENSION_CONFIDENCE = 0.6
 
-# Shared httpx client to bypass corporate proxy/firewall (matches sample pattern)
-_http = httpx.Client(verify=False)
-
-
 def _llm(model: str = SUBAGENT_MODEL, temperature: float = 0.1) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
         temperature=temperature,
-        http_client=_http,
         api_key=api_key,
     )
 
