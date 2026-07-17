@@ -4,7 +4,7 @@ An AI financial analyst agent built on [LangGraph](https://github.com/langchain-
 
 ## How it works
 
-![LangGraph flow](docs/langgraph_flow.png)
+![LangGraph flow](langgraph_flow.png)
 
 1. **`user_query`** — the validated ticker enters the graph.
 2. **`query_planner`** — an LLM decomposes the ticker into a `ResearchPlan` with 3-5 targeted questions per research dimension.
