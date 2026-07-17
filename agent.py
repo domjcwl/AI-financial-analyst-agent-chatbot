@@ -1,32 +1,30 @@
 """Deep-research stock-picking agent built on LangGraph.
 
-Graph (multi-item dispatch):
+The agent supports a SINGLE query type — stock_analysis — for ONE validated
+ticker per query. Input validation (rejecting sentences and unknown tickers)
+lives in tools.validate_query and is enforced by the CLI / Streamlit frontends
+before the graph runs.
+
+Graph:
 
   START
     -> user_query
-    -> query_planner          (produces ResearchPlan: list of QueryItems)
+    -> query_planner          (produces ResearchPlan: one stock_analysis item)
        |
        +-- dispatch_research (LangGraph Send):
-       |     for each item in plan.items:
-       |       if item.query_type == "stock_analysis":
-       |           Send -> fundamentals_agent / sentiment_agent /
-       |                   technical_agent     / macro_agent      (target=ticker)
-       |       elif item.query_type == "industry_analysis":
-       |           Send -> sentiment_agent / macro_agent          (target=industry)
-       |           (fundamentals + technical are SKIPPED)
+       |     Send -> fundamentals_agent / sentiment_agent /
+       |             technical_agent     / macro_agent      (target=ticker)
        v
     -> aggregator
     -> critic ---(gather_more)--> query_planner   # evidence loop
-              \--(sufficient)--> risk
-                                 -> synthesis
-                                    -> human_review ---(revise)--> synthesis
-                                                  \--(approve)--> final_report
-                                                                  -> END
+              \--(sufficient)--> synthesis
+                                 -> human_review ---(revise)--> synthesis
+                                               \--(approve)--> final_report
+                                                               -> END
 
-Per-dimension state slots are Dict[target, Finding] (target = ticker for stock
-items, industry name for industry items) with a merge reducer so parallel Send
-invocations don't clobber one another. Each slot is a Pydantic model defined in
-schemas.py.
+Per-dimension state slots are Dict[ticker, Finding] with a merge reducer so
+parallel Send invocations don't clobber one another. Each slot is a Pydantic
+model defined in schemas.py.
 
 The CLI / Rich rendering layer lives in cli.py; this module only defines the
 graph and exposes `app` and `build_graph()` for import.
@@ -58,9 +56,7 @@ from schemas import (
     CriticDecision,
     FinalReport,
     FundamentalsFindings,
-    Holding,
     HumanReview,
-    IndustryOutlook,
     InvestmentThesis,
     KeyMetric,
     MacroFindings,
@@ -107,6 +103,7 @@ def _llm(model: str = SUBAGENT_MODEL, temperature: float = 0.1) -> ChatOpenAI:
         model=model,
         temperature=temperature,
         api_key=api_key,
+        http_client=httpx.Client(verify=False)
     )
 
 
@@ -149,15 +146,36 @@ _RESEARCH_DISCIPLINE = (
     "   MULTIPLE calls with different query phrasings when using web/news search.\n"
     "2. Address EVERY plan question explicitly. If a question cannot be answered "
     "   from available data, add it to `unanswered_questions` in the finding.\n"
-    "3. Cite SPECIFIC numbers (revenue %, margin %, $ values, RSI, multiples) — "
-    "   not vague qualifiers like 'strong' or 'good'. Pull numbers from tool "
-    "   results, not from memory.\n"
-    "4. Capture every source URL you relied on; the structured-output step will "
+    "3. EVERY number and fact you report must come from a tool result in THIS "
+    "   session — never from your own training/internal knowledge. Do not recall "
+    "   prices, multiples, revenue, dates, or events from memory. If a tool did "
+    "   not return it, you do not have it: say so instead of supplying it.\n"
+    "4. Cite SPECIFIC numbers (revenue %, margin %, $ values, RSI, multiples) — "
+    "   not vague qualifiers like 'strong' or 'good'.\n"
+    "5. Capture every source URL you relied on; the structured-output step will "
     "   populate `sources`. Deduplicate.\n"
-    "5. Calibrate confidence honestly: 0.8+ requires 3+ sources and all "
+    "6. Calibrate confidence honestly: 0.8+ requires 3+ sources and all "
     "   questions answered; 0.5-0.7 for partial coverage; <0.5 when data is "
     "   sparse, stale, or contradictory.\n"
-    "6. Look for DISCONFIRMING evidence as well as supporting; do not cherry-pick.\n"
+    "7. Look for DISCONFIRMING evidence as well as supporting; do not cherry-pick.\n"
+)
+
+
+# Grounding clause injected into every node that REASONS over the assembled
+# findings (critic, synthesis, final report) and into the finding extractor.
+# These nodes have no tools — their only legitimate source of facts is the
+# findings text handed to them, so we forbid model/internal knowledge outright.
+_GROUNDING = (
+    "GROUNDING — non-negotiable:\n"
+    "- Use ONLY the research findings provided in this message as your source of "
+    "facts. Treat your own training/internal knowledge as OFF-LIMITS.\n"
+    "- Every figure, claim, catalyst, and recommendation must trace to a specific "
+    "finding above. Do not introduce companies, numbers, prices, dates, or events "
+    "that are not present in the findings.\n"
+    "- Do NOT 'correct', update, or supplement the findings from your own knowledge, "
+    "even if a value looks stale, surprising, or wrong. Report what the findings say.\n"
+    "- If the findings lack something needed, state explicitly that it is unavailable "
+    "or unverified rather than filling the gap from memory.\n"
 )
 
 
@@ -197,8 +215,11 @@ def _run_subagent(
             "Extract a structured finding from the analyst's research notes. "
             "Preserve specific numbers, multiples, and source URLs verbatim. "
             "Populate `unanswered_questions` with any plan question that the "
-            "notes did not address. Do not invent data — leave fields empty "
-            "or use a low confidence value when evidence is missing."
+            "notes did not address.\n\n"
+            "Use ONLY what appears in the notes. Do NOT add, infer, or 'fill in' "
+            "any number, fact, or source from your own training/internal knowledge. "
+            "If the notes don't contain a value, leave the field empty (or mark it "
+            "unknown) and lower the confidence — never invent data."
         )
         if questions:
             extractor_system += (
@@ -231,7 +252,6 @@ def user_query_node(state: State) -> State:
 
 _ALL_DIMS = ("fundamentals", "sentiment", "technical", "macro")
 _STOCK_DIMS = {"fundamentals", "sentiment", "technical", "macro"}
-_INDUSTRY_DIMS = {"sentiment", "macro"}
 
 _DIM_TO_QUESTION_FIELD = {
     "fundamentals": "fundamentals_questions",
@@ -242,15 +262,14 @@ _DIM_TO_QUESTION_FIELD = {
 
 
 def _valid_dims_for(item: QueryItem) -> set:
-    return _STOCK_DIMS if item.query_type == "stock_analysis" else _INDUSTRY_DIMS
+    return _STOCK_DIMS
 
 
 def query_planner_node(state: State) -> State:
     """Decompose the user query into a structured ResearchPlan.
 
-    The plan is a LIST of QueryItems. Each item is either:
-      - stock_analysis    (target = ticker, all 4 agents run)
-      - industry_analysis (target = industry label, only sentiment + macro run)
+    The plan holds exactly ONE stock_analysis QueryItem (target = ticker, all 4
+    agents run). The user's query is a single validated ticker symbol.
 
     On re-runs after an insufficient critic, this node:
       - locks the items list (query_type + target per item)
@@ -268,36 +287,19 @@ def query_planner_node(state: State) -> State:
     )
 
     base_system = (
-        "You are a senior buy-side research lead. Decompose the user's query into a "
-        "ResearchPlan containing one or more QueryItems.\n\n"
-        "There are exactly TWO query types:\n"
-        "  - stock_analysis    : a specific stock / ETF / company is named "
-        "(target = ticker). Runs fundamentals + sentiment + technical + macro.\n"
-        "  - industry_analysis : a sector / industry is referenced without a specific "
-        "company (target = a short canonical industry label). Runs ONLY sentiment + macro.\n\n"
-        "Decomposition rules:\n"
-        "1. ONE item per named stock. Resolve company names to tickers "
-        "   (e.g. 'Google' -> 'GOOGL', 'Lockheed' -> 'LMT'). ETFs are also "
-        "   stock_analysis (e.g. 'XLE', 'VOO', 'SPY').\n"
-        "2. ONE item per named industry / sector. Use a short canonical label "
-        "   (e.g. 'technology', 'healthcare', 'energy', 'financials', "
-        "   'consumer discretionary', 'industrials', 'utilities').\n"
-        "3. A single query MAY contain a mix of both types — produce as many items "
-        "   as the user implied. Examples:\n"
-        "     - 'Analyse NVDA, META, JPM, XLE' -> 4 stock_analysis items.\n"
-        "     - 'Analyse the tech and healthcare industries' -> 2 industry_analysis items.\n"
-        "     - 'Analyse the tech industry and tell me if Google is a buy' -> "
-        "       1 industry_analysis (technology) + 1 stock_analysis (GOOGL).\n"
-        "4. holdings: populate with quantity ONLY if the user states positions "
-        "   (e.g. '3 VOO, 4 GOOGL'). Otherwise empty.\n\n"
-        "Per-item questions (3-5 each):\n"
-        "  - stock_analysis items: populate fundamentals_questions, "
-        "    sentiment_questions, technical_questions, AND macro_questions.\n"
-        "  - industry_analysis items: populate ONLY sentiment_questions and "
-        "    macro_questions. Leave fundamentals_questions and "
-        "    technical_questions EMPTY — those agents will be skipped.\n"
-        "  - Each question must be specific enough that an analyst could answer "
-        "    it with a number or a named source. Avoid open-ended 'how is X doing?'.\n"
+        "You are a senior buy-side research lead. The user's query is a single "
+        "validated stock ticker symbol. Produce a ResearchPlan containing EXACTLY "
+        "ONE stock_analysis QueryItem.\n\n"
+        "The only supported query type is stock_analysis (target = ticker). It runs "
+        "fundamentals + sentiment + technical + macro.\n\n"
+        "Rules:\n"
+        "1. Set the item's query_type to 'stock_analysis' and target to the ticker "
+        "   exactly as given (e.g. 'NVDA', 'GOOGL', 'XLE').\n"
+        "2. Produce exactly one item — never more.\n\n"
+        "Questions (3-5 each): populate fundamentals_questions, sentiment_questions, "
+        "technical_questions, AND macro_questions. Each question must be specific "
+        "enough that an analyst could answer it with a number or a named source. "
+        "Avoid open-ended 'how is X doing?'.\n"
     )
 
     if is_rerun:
@@ -474,51 +476,29 @@ def fundamentals_node(task: dict) -> State:
 
 def sentiment_node(task: dict) -> State:
     target = task["target"]
-    query_type = task["query_type"]
     questions = task.get("questions") or []
 
-    if query_type == "stock_analysis":
-        role = (
-            f"You are a news & sentiment analyst covering {target}. Cover headlines, "
-            "analyst consensus, social sentiment, and concrete near-term catalysts."
-        )
-        prompt = (
-            f"Research news & sentiment for {target}.\n\n"
-            f"Workflow:\n"
-            f"1. Call tavily_news_search('{target} stock', days=14) for the most recent "
-            f"   news cycle. Also try 'days=7' for very recent events.\n"
-            f"2. Run a second tavily_news_search with a different angle (earnings, "
-            f"   analyst price target, downgrade/upgrade, regulatory).\n"
-            f"3. Use tavily_web_search to find analyst consensus and any aggregated "
-            f"   price target (e.g. CNN Money, Yahoo Finance analyst page, Zacks).\n"
-            f"4. Probe for DISCONFIRMING news (lawsuits, downgrades, customer losses) "
-            f"   so the assessment isn't one-sided.\n\n"
-            f"Address each question:\n- " + "\n- ".join(questions)
-            + f"\n\nReturn a finding with subject='{target}': headline summary, analyst "
-              "consensus, average price target (if available), social sentiment label, "
-              "specific named catalysts with dates if possible, and source URLs.\n"
-            + _rerun_note(task)
-        )
-    else:  # industry_analysis
-        role = (
-            f"You are a news & sentiment analyst covering the {target} industry. "
-            "Surface specific company names, dates, and concrete catalysts shaping the sector."
-        )
-        prompt = (
-            f"Research news & sentiment for the '{target}' industry.\n\n"
-            f"Workflow:\n"
-            f"1. tavily_news_search('{target} industry', days=14) — capture recent "
-            f"   developments across the sector.\n"
-            f"2. tavily_news_search with a second angle (regulation, earnings cycle, "
-            f"   M&A, leading company catalysts).\n"
-            f"3. tavily_web_search for analyst / industry write-ups; pull names of "
-            f"   specific companies, tickers, and dated events that the research surfaces.\n\n"
-            f"Address each question:\n- " + "\n- ".join(questions)
-            + f"\n\nReturn a finding with subject='{target}'. Populate "
-              "notable_catalysts with SPECIFIC named events / companies / dates from "
-              "the research, not generic phrases. Sources required.\n"
-            + _rerun_note(task)
-        )
+    role = (
+        f"You are a news & sentiment analyst covering {target}. Cover headlines, "
+        "analyst consensus, social sentiment, and concrete near-term catalysts."
+    )
+    prompt = (
+        f"Research news & sentiment for {target}.\n\n"
+        f"Workflow:\n"
+        f"1. Call tavily_news_search('{target} stock', days=14) for the most recent "
+        f"   news cycle. Also try 'days=7' for very recent events.\n"
+        f"2. Run a second tavily_news_search with a different angle (earnings, "
+        f"   analyst price target, downgrade/upgrade, regulatory).\n"
+        f"3. Use tavily_web_search to find analyst consensus and any aggregated "
+        f"   price target (e.g. CNN Money, Yahoo Finance analyst page, Zacks).\n"
+        f"4. Probe for DISCONFIRMING news (lawsuits, downgrades, customer losses) "
+        f"   so the assessment isn't one-sided.\n\n"
+        f"Address each question:\n- " + "\n- ".join(questions)
+        + f"\n\nReturn a finding with subject='{target}': headline summary, analyst "
+          "consensus, average price target (if available), social sentiment label, "
+          "specific named catalysts with dates if possible, and source URLs.\n"
+        + _rerun_note(task)
+    )
 
     def _fallback(err: str) -> SentimentFindings:
         return SentimentFindings(
@@ -592,50 +572,28 @@ def technical_node(task: dict) -> State:
 
 def macro_node(task: dict) -> State:
     target = task["target"]
-    query_type = task["query_type"]
     questions = task.get("questions") or []
 
-    if query_type == "stock_analysis":
-        role = (
-            f"You are a macro & sector analyst covering {target}. Place the company "
-            "within its sector and surface the cyclical / structural drivers that "
-            "matter for forward returns."
-        )
-        prompt = (
-            f"Research the macro & sector context for {target}.\n\n"
-            f"Workflow:\n"
-            f"1. Call get_peer_comparison({target}) — capture named peers and any "
-            f"   relative-value commentary.\n"
-            f"2. tavily_web_search for the sector outlook (e.g. '{target} sector "
-            f"   outlook 2025', industry growth drivers, regulatory headwinds).\n"
-            f"3. tavily_web_search for macro drivers relevant to this sector (rates, "
-            f"   FX, commodity, regulation, demand cycle).\n\n"
-            f"Address each question:\n- " + "\n- ".join(questions)
-            + f"\n\nReturn a finding with subject='{target}': sector, industry_trends "
-              "with specific named drivers, competitor_comparison naming 2+ peers, "
-              "macro_drivers, source URLs.\n"
-            + _rerun_note(task)
-        )
-    else:  # industry_analysis
-        role = (
-            f"You are a macro & sector analyst covering the {target} industry. "
-            "Identify the structural drivers, leading companies, and macro context."
-        )
-        prompt = (
-            f"Research the macro & sector context for the '{target}' industry.\n\n"
-            f"Workflow:\n"
-            f"1. tavily_web_search('{target} sector outlook') — capture the most "
-            f"   relevant structural drivers and growth/headwind narrative.\n"
-            f"2. tavily_web_search for the competitive landscape — name specific "
-            f"   companies / tickers that lead this industry.\n"
-            f"3. tavily_web_search for the macro context (rates, regulation, "
-            f"   supply / demand, geopolitical).\n\n"
-            f"Address each question:\n- " + "\n- ".join(questions)
-            + f"\n\nReturn a finding with subject='{target}': sector, industry trends "
-              "with named drivers, competitor_comparison naming 2+ leading companies, "
-              "macro drivers, source URLs.\n"
-            + _rerun_note(task)
-        )
+    role = (
+        f"You are a macro & sector analyst covering {target}. Place the company "
+        "within its sector and surface the cyclical / structural drivers that "
+        "matter for forward returns."
+    )
+    prompt = (
+        f"Research the macro & sector context for {target}.\n\n"
+        f"Workflow:\n"
+        f"1. Call get_peer_comparison({target}) — capture named peers and any "
+        f"   relative-value commentary.\n"
+        f"2. tavily_web_search for the sector outlook (e.g. '{target} sector "
+        f"   outlook 2025', industry growth drivers, regulatory headwinds).\n"
+        f"3. tavily_web_search for macro drivers relevant to this sector (rates, "
+        f"   FX, commodity, regulation, demand cycle).\n\n"
+        f"Address each question:\n- " + "\n- ".join(questions)
+        + f"\n\nReturn a finding with subject='{target}': sector, industry_trends "
+          "with specific named drivers, competitor_comparison naming 2+ peers, "
+          "macro_drivers, source URLs.\n"
+        + _rerun_note(task)
+    )
 
     def _fallback(err: str) -> MacroFindings:
         return MacroFindings(
@@ -709,8 +667,8 @@ def critic_node(state: State) -> State:
     system = (
         "You are a skeptical investment-committee chair. Decide if the assembled "
         "research is decision-ready.\n\n"
-        "Recall: stock_analysis items should have findings across all 4 dimensions; "
-        "industry_analysis items should have findings only for sentiment + macro.\n\n"
+        "The stock should have findings across all 4 dimensions "
+        "(fundamentals, sentiment, technical, macro).\n\n"
         "Mark sufficient=false if ANY of these are true:\n"
         f"  - Any applicable (target, dimension) finding has confidence < {MIN_DIMENSION_CONFIDENCE}.\n"
         "  - Any finding has non-empty `unanswered_questions`.\n"
@@ -723,7 +681,11 @@ def critic_node(state: State) -> State:
         "  - `gap_dimensions` must list ONLY the dimensions that need rework "
         "    (any subset of: fundamentals, sentiment, technical, macro).\n"
         "  - `gap_targets` must list ONLY the targets that need rework (empty = all).\n"
-        "  - Be surgical — listing every dimension wastes a research round.\n"
+        "  - Be surgical — listing every dimension wastes a research round.\n\n"
+        "Judge ONLY the findings below. Do not use your own knowledge of the company "
+        "to decide a gap is 'probably fine' or to fill in a missing figure — if the "
+        "evidence is not in the findings, it is a gap.\n\n"
+        + _GROUNDING
     )
     payload = (
         f"USER QUERY: {state['user_query']}\n"
@@ -737,55 +699,23 @@ def critic_node(state: State) -> State:
 
 
 def synthesis_node(state: State) -> State:
-    """Portfolio-manager voice: integrate the research into per-item outlooks
-    (each carrying its own future outlook, risk view, and recommendation)."""
+    """Portfolio-manager voice: integrate the research into a stock outlook
+    carrying a future outlook, risk view, and recommendation."""
     plan: ResearchPlan = state["research_plan"]
-    has_stocks = plan.has_stock_items()
-    has_industries = plan.has_industry_items()
-
-    type_guidance_parts: List[str] = []
-    if has_stocks:
-        type_guidance_parts.append(
-            "STOCK_OUTLOOKS — produce ONE entry per stock_analysis target. For each stock:\n"
-            "  - future_outlook: where the stock is headed and why, grounded in the findings.\n"
-            "  - bull_case: 2-4 specific bullish points (numbers, catalysts, analyst datapoints).\n"
-            "  - bear_case: 2-4 specific bearish points (disconfirming evidence from findings).\n"
-            "  - risk_rating: low / moderate / high / very_high.\n"
-            "  - risk_assessment: volatility (RSI, % off highs, beta), drawdown exposure, "
-            "    leverage (debt/equity, totalDebt), business concentration, idiosyncratic risks.\n"
-            "  - recommendation: Strong Buy / Buy / Hold / Sell / Strong Sell — must follow the "
-            "    weight of bull vs bear evidence, not be retrofitted to it.\n"
-            "  - conviction + rationale (1-2 sentences)."
-        )
-    if has_industries:
-        type_guidance_parts.append(
-            "INDUSTRY_OUTLOOKS — produce ONE entry per industry_analysis target. For each industry:\n"
-            "  - future_outlook: the sector trajectory, drivers, and headwinds — specific named "
-            "    catalysts and players where available.\n"
-            "  - risk_rating: low / moderate / high / very_high.\n"
-            "  - risk_assessment: macro drivers (rates, FX, demand cycle), regulatory exposure, "
-            "    cyclicality, competitive intensity.\n"
-            "  - recommendation: Overweight / Neutral / Underweight — sector positioning call.\n"
-            "  - conviction + rationale (1-2 sentences)."
-        )
-    if has_stocks and has_industries:
-        type_guidance_parts.append(
-            "MIXED plan — thesis_summary must connect the dots: explain how the industry "
-            "backdrop shapes each stock recommendation."
-        )
-    if not has_stocks:
-        type_guidance_parts.append(
-            "INDUSTRY-ONLY plan — leave stock_outlooks EMPTY. thesis_summary should directly "
-            "answer the user's question using the industry findings."
-        )
-    if not has_industries:
-        type_guidance_parts.append(
-            "STOCK-ONLY plan — leave industry_outlooks EMPTY."
-        )
 
     system = (
-        "You are a portfolio manager writing an investment thesis. Integrate the "
-        "research into a structured InvestmentThesis with per-item outlooks.\n\n"
+        "You are a portfolio manager writing an investment thesis for a single "
+        "stock. Integrate the research into a structured InvestmentThesis.\n\n"
+        "STOCK_OUTLOOKS — produce ONE entry for the analysed ticker:\n"
+        "  - future_outlook: where the stock is headed and why, grounded in the findings.\n"
+        "  - bull_case: 2-4 specific bullish points (numbers, catalysts, analyst datapoints).\n"
+        "  - bear_case: 2-4 specific bearish points (disconfirming evidence from findings).\n"
+        "  - risk_rating: low / moderate / high / very_high.\n"
+        "  - risk_assessment: volatility (RSI, % off highs, beta), drawdown exposure, "
+        "    leverage (debt/equity, totalDebt), business concentration, idiosyncratic risks.\n"
+        "  - recommendation: Strong Buy / Buy / Hold / Sell / Strong Sell — must follow the "
+        "    weight of bull vs bear evidence, not be retrofitted to it.\n"
+        "  - conviction + rationale (1-2 sentences).\n\n"
         "Discipline:\n"
         "  - Every bull / bear case point and every risk claim must be backed by a "
         "    SPECIFIC fact from the findings (a number, a named catalyst, an analyst "
@@ -793,8 +723,8 @@ def synthesis_node(state: State) -> State:
         "  - Recommendations must follow the evidence, not the other way around. If "
         "    the bear case outweighs the bull case, the recommendation reflects that.\n"
         "  - Acknowledge contradictions explicitly — don't paper over them.\n"
-        "  - overall_conviction reflects the FULL set of items, not the single loudest one.\n\n"
-        + "\n\n".join(type_guidance_parts)
+        "  - overall_conviction reflects the weight of the evidence.\n\n"
+        + _GROUNDING
     )
 
     revision_note = ""
@@ -804,16 +734,10 @@ def synthesis_node(state: State) -> State:
             f"{state['human_review'].feedback}"
         )
 
-    holdings_str = ""
-    if plan.holdings:
-        holdings_str = "\nHOLDINGS (quantities):\n" + "\n".join(
-            f"  {h.ticker}: {h.quantity}" for h in plan.holdings
-        )
-
     payload = (
         f"USER QUERY: {state['user_query']}\n"
         + _plan_summary(plan)
-        + holdings_str + "\n\n"
+        + "\n\n"
         + _all_findings_payload(state)
         + revision_note
     )
@@ -825,18 +749,14 @@ def human_review_node(state: State) -> State:
     """Pause the graph for investor approval (LangGraph interrupt)."""
     thesis: InvestmentThesis = state["thesis"]
     plan: ResearchPlan = state["research_plan"]
-    is_informational = not plan.has_stock_items()
     payload = {
         "items": [
             {"query_type": i.query_type, "target": i.target} for i in plan.items
         ],
         "stock_targets": plan.stock_targets(),
-        "industry_targets": plan.industry_targets(),
         "overall_conviction": thesis.overall_conviction,
         "stock_outlooks": [o.model_dump() for o in thesis.stock_outlooks],
-        "industry_outlooks": [o.model_dump() for o in thesis.industry_outlooks],
         "thesis_summary": thesis.thesis_summary,
-        "is_informational": is_informational,
         "instruction": (
             "Resume with {'decision': 'approve'} to finalise, or "
             "{'decision': 'revise', 'feedback': '<what to change>'} to iterate."
@@ -853,61 +773,31 @@ def human_review_node(state: State) -> State:
 
 def final_report_node(state: State) -> State:
     plan: ResearchPlan = state["research_plan"]
-    has_stocks = plan.has_stock_items()
-    has_industries = plan.has_industry_items()
 
-    sections: List[str] = ["  1. Headline", "  2. Executive summary"]
-    next_no = 3
-    if has_industries:
-        sections.append(
-            f"  {next_no}. Industry breakdown — ONE subsection per industry, each containing: "
-            "future outlook, risk assessment, recommendation (Overweight/Neutral/Underweight). "
-            "Cite specific drivers, named companies, and sources."
-        )
-        next_no += 1
-    if has_stocks:
-        sections.append(
-            f"  {next_no}. Per-stock breakdown — ONE subsection per ticker, each containing: "
-            "future outlook, bull case, bear case, risk assessment, recommendation "
-            "(Strong Buy/Buy/Hold/Sell/Strong Sell). Cite specific numbers and sources."
-        )
-        next_no += 1
-    sections.append(
-        f"  {next_no}. Evidence by dimension (Fundamentals, Sentiment, Technical, Macro)"
-    )
-
-    if has_stocks and has_industries:
-        mix_note = (
-            "MIXED plan — connect the two: explain how each industry's outlook shapes the "
-            "stock recommendations that sit inside it.\n\n"
-        )
-    elif has_industries and not has_stocks:
-        mix_note = (
-            "INDUSTRY-ONLY plan — the report is informational, not a per-stock recommendation. "
-            "Set primary_recommendation to a brief sector summary (e.g. 'Overweight Technology, "
-            "Neutral Healthcare').\n\n"
-        )
-    else:
-        mix_note = ""
+    sections: List[str] = [
+        "  1. Headline",
+        "  2. Executive summary",
+        "  3. Stock breakdown — future outlook, bull case, bear case, risk assessment, "
+        "recommendation (Strong Buy/Buy/Hold/Sell/Strong Sell). Cite specific numbers and sources.",
+        "  4. Evidence by dimension (Fundamentals, Sentiment, Technical, Macro)",
+    ]
 
     system = (
         "You are a senior equity-research editor. Produce a polished, investor-ready "
         "markdown report from the InvestmentThesis and research findings.\n\n"
-        f"{mix_note}"
         "Sections (in order):\n"
         + "\n".join(sections) + "\n\n"
         "Discipline: cite specific numbers and named sources from the research. "
         "No filler. Use markdown tables where they aid comparison.\n\n"
-        "Populate tickers_covered with the stock_outlook tickers and "
-        "industries_covered with the industry_outlook labels. primary_recommendation "
-        "should be a concise headline phrase summarising the calls."
+        "Populate tickers_covered with the stock_outlook ticker. "
+        "primary_recommendation should be a concise headline phrase summarising the call.\n\n"
+        + _GROUNDING
     )
 
     payload = (
         f"USER QUERY: {state['user_query']}\n"
         + _plan_summary(plan)
-        + f"\nSTOCK TARGETS:    {plan.stock_targets()}\n"
-        + f"INDUSTRY TARGETS: {plan.industry_targets()}\n\n"
+        + f"\nSTOCK TARGETS:    {plan.stock_targets()}\n\n"
         f"THESIS:\n{state['thesis'].model_dump_json(indent=2)}\n\n"
         + _all_findings_payload(state)
     )
@@ -986,7 +876,6 @@ def build_graph():
     serde = JsonPlusSerializer(allowed_msgpack_modules=[
         ResearchPlan,
         QueryItem,
-        Holding,
         FundamentalsFindings,
         KeyMetric,
         SentimentFindings,
@@ -995,7 +884,6 @@ def build_graph():
         CriticDecision,
         InvestmentThesis,
         StockOutlook,
-        IndustryOutlook,
         HumanReview,
         FinalReport,
     ])

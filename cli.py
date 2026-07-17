@@ -25,6 +25,7 @@ from rich.text import Text
 
 from agent import app
 from schemas import InvestmentThesis, QueryItem, ResearchPlan
+from tools import validate_query
 
 
 console = Console()
@@ -55,7 +56,6 @@ _DIM_META = [
 ]
 
 _STOCK_DIMS = {"fundamentals", "sentiment", "technical", "macro"}
-_INDUSTRY_DIMS = {"sentiment", "macro"}
 
 
 # Module-level state used to align the Query Planner panel with what the
@@ -73,7 +73,7 @@ def _reset_render_state() -> None:
 
 
 def _valid_dims(item: QueryItem) -> set[str]:
-    return _STOCK_DIMS if item.query_type == "stock_analysis" else _INDUSTRY_DIMS
+    return _STOCK_DIMS
 
 
 def _unanswered_block(questions: list[str]) -> str:
@@ -128,8 +128,8 @@ def _predicted_routes(plan: ResearchPlan) -> list[str]:
 
 def _item_block(item: QueryItem, active_dims: set[str]) -> Text:
     """Render one QueryItem as a labelled, indented block with its questions."""
-    type_color = "yellow" if item.query_type == "stock_analysis" else "cyan"
-    type_label = "stock" if item.query_type == "stock_analysis" else "industry"
+    type_color = "yellow"
+    type_label = "stock"
 
     out = Text()
     out.append(f"\n[{type_label}] ", style=f"bold {type_color}")
@@ -166,25 +166,12 @@ def _format_payload(node: str, payload: dict):
         plan: Optional[ResearchPlan] = payload.get("research_plan")
         if not plan:
             return None
-        n_stock = len(plan.stock_targets())
-        n_industry = len(plan.industry_targets())
-        type_parts = []
-        if n_stock:
-            type_parts.append(f"{n_stock} x stock_analysis")
-        if n_industry:
-            type_parts.append(f"{n_industry} x industry_analysis")
-
         t = Table(show_header=False, box=None, padding=(0, 1))
         t.add_column(style="bold")
         t.add_column()
-        t.add_row("Query types", ", ".join(type_parts) or "(none)")
-        t.add_row("Items", str(len(plan.items)))
+        t.add_row("Query type", "stock_analysis")
         if plan.stock_targets():
-            t.add_row("Stocks", ", ".join(plan.stock_targets()))
-        if plan.industry_targets():
-            t.add_row("Industries", ", ".join(plan.industry_targets()))
-        if plan.holdings:
-            t.add_row("Holdings", ", ".join(f"{h.quantity:g} {h.ticker}" for h in plan.holdings))
+            t.add_row("Stock", ", ".join(plan.stock_targets()))
         t.add_row("Horizon", plan.investor_horizon)
         t.add_row("Routing", ", ".join(_predicted_routes(plan)) or "(nothing — re-plan empty)")
 
@@ -275,12 +262,6 @@ def _format_payload(node: str, payload: dict):
                 f"({o.conviction}) — risk: [red]{o.risk_rating}[/]"
                 for o in th.stock_outlooks
             )
-        if th.industry_outlooks:
-            body += "\n[bold]Industry outlooks:[/]\n" + "\n".join(
-                f"  - {o.industry}: [bold]{o.recommendation}[/] "
-                f"({o.conviction}) — risk: [red]{o.risk_rating}[/]"
-                for o in th.industry_outlooks
-            )
         return body
 
     if node == "final_report":
@@ -340,11 +321,8 @@ def prompt_human(payload: dict) -> dict:
     summary.add_column(style="bold")
     summary.add_column()
     stock_targets = payload.get("stock_targets") or []
-    industry_targets = payload.get("industry_targets") or []
     if stock_targets:
-        summary.add_row("Stocks", ", ".join(stock_targets))
-    if industry_targets:
-        summary.add_row("Industries", ", ".join(industry_targets))
+        summary.add_row("Stock", ", ".join(stock_targets))
     summary.add_row("Overall conviction", str(payload.get("overall_conviction")))
     console.print(Panel(summary, border_style="yellow"))
 
@@ -368,18 +346,6 @@ def prompt_human(payload: dict) -> dict:
         console.print(_bullets(o.get('bull_case', []), "green"))
         console.print("[bold red]Bear case[/]")
         console.print(_bullets(o.get('bear_case', []), "red"))
-        console.print(f"[bold yellow]Risk assessment:[/] {o.get('risk_assessment')}")
-        console.print(f"[bold]Rationale:[/] {o.get('rationale')}")
-
-    industry_outlooks = payload.get("industry_outlooks") or []
-    for o in industry_outlooks:
-        console.print(Rule(title=f"[bold cyan]Industry: {o.get('industry')}[/]", style="cyan"))
-        console.print(
-            f"[bold]Recommendation:[/] [bold]{o.get('recommendation')}[/]   "
-            f"[bold]Conviction:[/] {o.get('conviction')}   "
-            f"[bold]Risk:[/] [red]{o.get('risk_rating')}[/]"
-        )
-        console.print(f"[bold]Future outlook:[/] {o.get('future_outlook')}")
         console.print(f"[bold yellow]Risk assessment:[/] {o.get('risk_assessment')}")
         console.print(f"[bold]Rationale:[/] {o.get('rationale')}")
     console.print()
@@ -473,11 +439,11 @@ def run_research(query: str, config: dict) -> None:
 def main() -> None:
     console.print(Rule(title="[bold blue]Deep Research Stock Picker[/]", style="blue"))
     console.print(
-        "[dim]Ask any investment question. Examples:\n"
-        "  - 'Is TSLA a buy for the next year?' (one stock_analysis)\n"
-        "  - 'Analyse my positions: 3 VOO, 4 GOOGL, 7 NVDA, 2 JPM' (multi stock_analysis)\n"
-        "  - 'How are the tech and healthcare industries doing?' (multi industry_analysis)\n"
-        "  - 'Analyse the tech industry and tell me if GOOGL is a buy' (mixed)\n"
+        "[dim]Enter a single stock ticker symbol to analyse. Examples:\n"
+        "  - 'NVDA'\n"
+        "  - 'GOOGL'\n"
+        "  - 'JPM'\n"
+        "Sentences, questions, and multiple symbols are not accepted.\n"
         "Type 'exit' to quit.[/]\n"
     )
 
@@ -485,7 +451,7 @@ def main() -> None:
     while True:
         session += 1
         try:
-            query = Prompt.ask("[bold cyan]Question[/]").strip()
+            query = Prompt.ask("[bold cyan]Ticker[/]").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye.[/]")
             return
@@ -494,6 +460,13 @@ def main() -> None:
         if query.lower() in ("exit", "quit", "q"):
             console.print("[dim]Goodbye.[/]")
             return
+
+        ticker, error = validate_query(query)
+        if error:
+            console.print(f"[bold red]Invalid input:[/] {error}")
+            console.print()
+            continue
+        query = ticker
 
         config = {"configurable": {"thread_id": f"session-{session}"}}
         try:

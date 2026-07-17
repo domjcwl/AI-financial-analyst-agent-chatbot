@@ -19,7 +19,8 @@ import contextlib
 import io
 import logging
 import os
-from typing import Optional
+import re
+from typing import Optional, Tuple
 
 # Mute noisy library loggers before importing yfinance (it logs HTTP 404s etc.).
 for _noisy in ("yfinance", "peewee", "urllib3", "urllib3.connectionpool",
@@ -237,6 +238,63 @@ def _safe_float(v) -> Optional[float]:
         return f
     except (TypeError, ValueError):
         return None
+
+
+# ---------- Input validation (single-ticker stock analysis only) ----------
+
+# A plausible ticker: 1-5 letters, with an optional class/exchange suffix
+# (e.g. BRK.B, BF-B). Anything else is treated as not-a-ticker.
+_TICKER_RE = re.compile(r"^[A-Za-z]{1,5}(?:[.\-][A-Za-z]{1,4})?$")
+
+
+def is_real_ticker(ticker: str) -> bool:
+    """Return True only if yfinance can resolve live market data for `ticker`.
+
+    Used to reject made-up symbols before any (expensive) research runs. We
+    accept the symbol if fast_info exposes a last price, otherwise fall back to
+    a short price-history pull — a fabricated ticker yields neither."""
+    with _silence_io():
+        try:
+            t = yf.Ticker(ticker)
+            fi = t.fast_info or {}
+            if _safe_float(fi.get("last_price")) is not None:
+                return True
+            hist = t.history(period="5d")
+            return not hist.empty
+        except Exception:
+            return False
+
+
+def validate_query(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    """Gate the user's input down to a single, real stock ticker.
+
+    The agent only supports stock analysis for ONE ticker at a time. Returns
+    ``(ticker, None)`` on success, or ``(None, error_message)`` when the input
+    is a sentence, contains more than one symbol, or names a ticker that does
+    not resolve to real market data.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None, "Please enter a stock ticker symbol (e.g. 'NVDA')."
+
+    tokens = [t for t in re.split(r"[,\s]+", text) if t]
+
+    # More than one token (or a single non-ticker word) means a sentence /
+    # phrase / multi-symbol input — none of which we accept.
+    if len(tokens) != 1 or not _TICKER_RE.match(tokens[0]):
+        return None, (
+            "Stock analysis accepts exactly one ticker symbol — e.g. 'NVDA'. "
+            "Sentences, questions, and multiple symbols are not supported."
+        )
+
+    ticker = tokens[0].upper()
+    if not is_real_ticker(ticker):
+        return None, (
+            f"'{ticker}' is not a recognised ticker symbol. "
+            "Enter a valid stock ticker (e.g. 'NVDA', 'GOOGL', 'JPM')."
+        )
+
+    return ticker, None
 
 
 # ---------- Curated tool buckets per research agent ----------

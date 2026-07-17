@@ -4,33 +4,19 @@ from pydantic import BaseModel, Field
 
 # ---------- Planning ----------
 
-class Holding(BaseModel):
-    """A single portfolio holding (used when the user gives quantities)."""
-    ticker: str
-    quantity: float = Field(description="Number of shares or units")
-
-
 class QueryItem(BaseModel):
     """One analysis unit inside a ResearchPlan.
 
-    A single user query can decompose into multiple items. Routing per item:
-      - stock_analysis    : runs fundamentals + sentiment + technical + macro
-                            agents on the named ticker.
-      - industry_analysis : runs ONLY sentiment + macro agents on the named
-                            sector / industry (fundamentals and technical are
-                            not meaningful at the industry level).
+    The agent supports a SINGLE query type — stock_analysis — which runs the
+    fundamentals + sentiment + technical + macro agents on one ticker.
     """
-    query_type: Literal["stock_analysis", "industry_analysis"]
+    query_type: Literal["stock_analysis"] = "stock_analysis"
     target: str = Field(
-        description=(
-            "What to research. For stock_analysis: the ticker symbol (e.g. "
-            "'NVDA', 'GOOGL', 'XLE'). For industry_analysis: a short canonical "
-            "industry/sector label (e.g. 'technology', 'healthcare', 'energy')."
-        ),
+        description="The ticker symbol to research (e.g. 'NVDA', 'GOOGL', 'JPM').",
     )
     fundamentals_questions: List[str] = Field(
         default_factory=list,
-        description="3-5 fundamentals questions. EMPTY for industry_analysis items.",
+        description="3-5 fundamentals questions.",
     )
     sentiment_questions: List[str] = Field(
         default_factory=list,
@@ -38,7 +24,7 @@ class QueryItem(BaseModel):
     )
     technical_questions: List[str] = Field(
         default_factory=list,
-        description="3-5 technical analysis questions. EMPTY for industry_analysis items.",
+        description="3-5 technical analysis questions.",
     )
     macro_questions: List[str] = Field(
         default_factory=list,
@@ -47,26 +33,15 @@ class QueryItem(BaseModel):
 
 
 class ResearchPlan(BaseModel):
-    """Decomposed research plan produced by the Query Planner.
+    """Research plan produced by the Query Planner.
 
-    A query can decompose into MULTIPLE items. Examples:
-      - 'Analyse my portfolio of NVDA, META, JPM, XLE'
-            -> 4 stock_analysis items
-      - 'Analyse the tech and healthcare industries'
-            -> 2 industry_analysis items
-      - 'Analyse the tech industry and tell me if Google is a good buy'
-            -> 1 industry_analysis (technology) + 1 stock_analysis (GOOGL)
+    The agent analyses exactly ONE stock per query, so the plan always holds a
+    single stock_analysis item, e.g. 'NVDA' -> 1 stock_analysis item.
     """
     items: List[QueryItem] = Field(
         min_length=1,
-        description="One or more analysis items, each routed independently.",
-    )
-    holdings: List[Holding] = Field(
-        default_factory=list,
-        description=(
-            "Portfolio holdings with quantities, only when the user explicitly "
-            "states positions (e.g. '3 VOO, 4 GOOGL'). Empty otherwise."
-        ),
+        max_length=1,
+        description="Exactly one stock_analysis item.",
     )
     investor_horizon: Literal["short_term", "medium_term", "long_term"] = Field(
         default="medium_term",
@@ -78,17 +53,11 @@ class ResearchPlan(BaseModel):
     def stock_targets(self) -> List[str]:
         return [i.target for i in self.items if i.query_type == "stock_analysis"]
 
-    def industry_targets(self) -> List[str]:
-        return [i.target for i in self.items if i.query_type == "industry_analysis"]
-
     def all_targets(self) -> List[str]:
         return [i.target for i in self.items]
 
     def has_stock_items(self) -> bool:
         return any(i.query_type == "stock_analysis" for i in self.items)
-
-    def has_industry_items(self) -> bool:
-        return any(i.query_type == "industry_analysis" for i in self.items)
 
 
 # ---------- Per-dimension findings ----------
@@ -128,9 +97,7 @@ class FundamentalsFindings(BaseModel):
 
 
 class SentimentFindings(BaseModel):
-    subject: str = Field(
-        description="Ticker symbol (stock_analysis) or industry name (industry_analysis)."
-    )
+    subject: str = Field(description="Ticker symbol under analysis.")
     headline_summary: str
     analyst_consensus: str
     average_price_target: Optional[float] = None
@@ -172,9 +139,7 @@ class TechnicalFindings(BaseModel):
 
 
 class MacroFindings(BaseModel):
-    subject: str = Field(
-        description="Ticker symbol (stock_analysis) or industry name (industry_analysis)."
-    )
+    subject: str = Field(description="Ticker symbol under analysis.")
     sector: str
     industry_trends: str
     competitor_comparison: str
@@ -212,8 +177,7 @@ class CriticDecision(BaseModel):
     gap_targets: List[str] = Field(
         default_factory=list,
         description=(
-            "Specific item targets (tickers or industry names) needing more "
-            "research. Empty = re-research all items."
+            "Specific tickers needing more research. Empty = re-research all."
         ),
     )
 
@@ -242,37 +206,15 @@ class StockOutlook(BaseModel):
     rationale: str = Field(description="1-2 sentence justification for the recommendation.")
 
 
-class IndustryOutlook(BaseModel):
-    """Per-industry synthesis: future outlook, risk, recommendation."""
-    industry: str
-    future_outlook: str = Field(
-        description="Forward-looking narrative for the industry — drivers, trajectory."
-    )
-    risk_rating: Literal["low", "moderate", "high", "very_high"]
-    risk_assessment: str = Field(
-        description="Narrative risk view — macro, regulatory, cyclical, competitive risks."
-    )
-    recommendation: Literal["Overweight", "Neutral", "Underweight"]
-    conviction: Literal["low", "medium", "high"]
-    rationale: str = Field(description="1-2 sentence justification for the recommendation.")
-
-
 class InvestmentThesis(BaseModel):
-    """Integrated thesis: per-stock and per-industry outlooks plus a headline summary."""
+    """Integrated thesis: the stock outlook plus a headline summary."""
     thesis_summary: str = Field(
-        description=(
-            "Top-level narrative integrating all analyses. For mixed plans, "
-            "explain how the industry backdrop shapes each stock call."
-        ),
+        description="Top-level narrative integrating all dimensions of the analysis.",
     )
     overall_conviction: Literal["low", "medium", "high"]
     stock_outlooks: List[StockOutlook] = Field(
         default_factory=list,
-        description="One entry per stock_analysis item. Empty for industry-only plans.",
-    )
-    industry_outlooks: List[IndustryOutlook] = Field(
-        default_factory=list,
-        description="One entry per industry_analysis item. Empty for stock-only plans.",
+        description="One entry for the analysed stock.",
     )
 
 
@@ -292,17 +234,13 @@ class FinalReport(BaseModel):
     headline: str
     primary_recommendation: str = Field(
         description=(
-            "Concise headline phrase summarising the calls across all outlooks "
-            "(e.g. 'Buy NVDA, Hold META, Overweight Technology'). Free-form."
+            "Concise headline phrase summarising the call "
+            "(e.g. 'Buy NVDA'). Free-form."
         ),
     )
     tickers_covered: List[str] = Field(
         default_factory=list,
-        description="Tickers from stock_analysis items.",
-    )
-    industries_covered: List[str] = Field(
-        default_factory=list,
-        description="Industries from industry_analysis items.",
+        description="The analysed ticker.",
     )
     executive_summary: str
     detailed_thesis: str

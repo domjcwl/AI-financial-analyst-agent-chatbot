@@ -18,6 +18,7 @@ from langgraph.types import Command
 
 from agent import app
 from schemas import QueryItem, ResearchPlan
+from tools import validate_query
 
 
 # ---------- Page setup ----------
@@ -88,11 +89,10 @@ _DIM_META = [
 ]
 
 _STOCK_DIMS = {"fundamentals", "sentiment", "technical", "macro"}
-_INDUSTRY_DIMS = {"sentiment", "macro"}
 
 
 def _valid_dims(item: QueryItem) -> set[str]:
-    return _STOCK_DIMS if item.query_type == "stock_analysis" else _INDUSTRY_DIMS
+    return _STOCK_DIMS
 
 
 def _active_dims_for_item(
@@ -185,28 +185,12 @@ def _render_query_planner(
     gap_targets: Optional[set[str]],
 ) -> None:
     # --- Summary block ---
-    n_stock = len(plan.stock_targets())
-    n_industry = len(plan.industry_targets())
-    type_parts: list[str] = []
-    if n_stock:
-        type_parts.append(f"{n_stock} × stock_analysis")
-    if n_industry:
-        type_parts.append(f"{n_industry} × industry_analysis")
-
     _section("Query type")
-    st.markdown(", ".join(type_parts) or "(none)")
+    st.markdown("stock_analysis")
 
     if plan.stock_targets():
-        _section("Stocks")
+        _section("Stock")
         st.markdown(_e(", ".join(plan.stock_targets())))
-    if plan.industry_targets():
-        _section("Industries")
-        st.markdown(_e(", ".join(plan.industry_targets())))
-    if plan.holdings:
-        _section("Holdings")
-        st.markdown(
-            _e(", ".join(f"{h.quantity:g} {h.ticker}" for h in plan.holdings))
-        )
 
     _section("Horizon")
     st.markdown(plan.investor_horizon)
@@ -231,8 +215,8 @@ def _render_query_planner_items(
 ) -> None:
     for item in plan.items:
         active = _active_dims_for_item(item, gap_dims, gap_targets)
-        type_color = "orange" if item.query_type == "stock_analysis" else "blue"
-        type_label = "stock" if item.query_type == "stock_analysis" else "industry"
+        type_color = "orange"
+        type_label = "stock"
 
         skipped_note = (
             " <i style='opacity:0.6'>(skipped this round)</i>" if not active else ""
@@ -487,18 +471,6 @@ def _render_synthesis(payload: dict) -> None:
             }
             for o in th.stock_outlooks
         ],
-        industry_outlooks=[
-            {
-                "industry":        o.industry,
-                "recommendation":  o.recommendation,
-                "conviction":      o.conviction,
-                "risk_rating":     o.risk_rating,
-                "future_outlook":  o.future_outlook,
-                "risk_assessment": o.risk_assessment,
-                "rationale":       o.rationale,
-            }
-            for o in th.industry_outlooks
-        ],
     )
 
 
@@ -518,13 +490,6 @@ _REC_COLOR_STOCK = {
     "Sell":        "orange",
     "Strong Sell": "red",
 }
-_REC_COLOR_INDUSTRY = {
-    "Overweight":  "green",
-    "Neutral":     "blue",
-    "Underweight": "orange",
-}
-
-
 def _badge(label: str, value: str, color: str) -> str:
     return f"**{label}:** :{color}-background[ {value} ]"
 
@@ -534,7 +499,6 @@ def _render_thesis_body(
     thesis_summary: Optional[str],
     overall_conviction: Optional[str],
     stock_outlooks: list[dict],
-    industry_outlooks: list[dict],
 ) -> None:
     # --- Top-level thesis ---
     _section("Thesis")
@@ -549,12 +513,6 @@ def _render_thesis_body(
         _section(f"Stock outlooks ({len(stock_outlooks)})")
         for o in stock_outlooks:
             _render_stock_outlook_card(o)
-
-    # --- Industry outlooks ---
-    if industry_outlooks:
-        _section(f"Industry outlooks ({len(industry_outlooks)})")
-        for o in industry_outlooks:
-            _render_industry_outlook_card(o)
 
 
 def _render_stock_outlook_card(o: dict) -> None:
@@ -603,34 +561,6 @@ def _render_stock_outlook_card(o: dict) -> None:
         st.markdown(_e(o.get("rationale")))
 
 
-def _render_industry_outlook_card(o: dict) -> None:
-    rec = o.get("recommendation") or "—"
-    conv = o.get("conviction") or "—"
-    risk = o.get("risk_rating") or "—"
-    rec_color  = _REC_COLOR_INDUSTRY.get(rec, "gray")
-    conv_color = _CONVICTION_COLOR.get(conv, "gray")
-    risk_color = _RISK_COLOR.get(risk, "gray")
-
-    with st.container(border=True):
-        st.markdown(
-            f"#### :violet[Industry] &nbsp; `{_e(o.get('industry'))}`"
-        )
-        st.markdown(
-            f"{_badge('Recommendation', rec, rec_color)} &nbsp; "
-            f"{_badge('Conviction', conv, conv_color)} &nbsp; "
-            f"{_badge('Risk', risk, risk_color)}"
-        )
-
-        st.markdown("**Future outlook**")
-        st.markdown(_e(o.get("future_outlook")))
-
-        st.markdown("**Risk assessment**")
-        st.markdown(_e(o.get("risk_assessment")))
-
-        st.markdown("**Rationale**")
-        st.markdown(_e(o.get("rationale")))
-
-
 # ---------- Top-level block renderer ----------
 
 # Map node-name -> render function (one per agent panel).
@@ -651,6 +581,10 @@ def render_block(block: dict) -> None:
     if btype == "user":
         with st.chat_message("user"):
             st.markdown(block["text"])
+
+    elif btype == "error":
+        with st.chat_message("assistant"):
+            st.error(block["text"])
 
     elif btype == "node":
         node = block["node"]
@@ -687,8 +621,6 @@ def render_block(block: dict) -> None:
                 covered_chips: list[str] = []
                 for t in block.get("tickers_covered") or []:
                     covered_chips.append(f"`{_e(t)}`")
-                for ind in block.get("industries_covered") or []:
-                    covered_chips.append(f"`{_e(ind)}`")
                 if covered_chips:
                     st.markdown("**Covered:** " + " ".join(covered_chips))
 
@@ -723,7 +655,6 @@ def render_hitl_form(payload: dict) -> None:
                 thesis_summary=payload.get("thesis_summary"),
                 overall_conviction=payload.get("overall_conviction"),
                 stock_outlooks=payload.get("stock_outlooks") or [],
-                industry_outlooks=payload.get("industry_outlooks") or [],
             )
 
             st.markdown("<hr class='agent-divider'/>", unsafe_allow_html=True)
@@ -829,7 +760,6 @@ def _stream_graph(stream_input) -> None:
                         "headline": fr.headline,
                         "primary_recommendation": fr.primary_recommendation,
                         "tickers_covered": list(fr.tickers_covered or []),
-                        "industries_covered": list(fr.industries_covered or []),
                         "markdown": fr.full_markdown,
                     }
                     st.session_state.blocks.append(block)
@@ -915,12 +845,12 @@ def main() -> None:
     # Empty-state hero
     if not st.session_state.blocks and st.session_state.action is None:
         st.markdown("## Deep Research Stock Picker")
-        st.caption("Ask any investment question. Examples:")
+        st.caption("Enter a single stock ticker symbol to analyse. Examples:")
         st.markdown(
-            "- *Is TSLA a buy for the next year?*  *(one stock_analysis)*\n"
-            "- *Analyse my positions: 3 VOO, 4 GOOGL, 7 NVDA, 2 JPM*  *(multi stock_analysis)*\n"
-            "- *How are the tech and healthcare industries doing?*  *(multi industry_analysis)*\n"
-            "- *Analyse the tech industry and tell me if GOOGL is a buy*  *(mixed)*"
+            "- *NVDA*\n"
+            "- *GOOGL*\n"
+            "- *JPM*\n\n"
+            "Sentences, questions, and multiple symbols are not accepted."
         )
 
     # Replay all blocks accumulated so far.
@@ -973,12 +903,16 @@ def main() -> None:
     placeholder = (
         "Resolve the investor review above to continue…"
         if disabled
-        else "Ask any investment question…"
+        else "Enter a stock ticker symbol (e.g. NVDA)…"
     )
     if query := st.chat_input(placeholder, disabled=disabled):
         st.session_state.blocks.append({"type": "user", "text": query})
-        st.session_state.pending_query = query
-        st.session_state.action = "run"
+        ticker, error = validate_query(query)
+        if error:
+            st.session_state.blocks.append({"type": "error", "text": error})
+        else:
+            st.session_state.pending_query = ticker
+            st.session_state.action = "run"
         st.rerun()
 
 
